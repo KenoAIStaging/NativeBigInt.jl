@@ -129,8 +129,10 @@ function run_sqr(sizes)
     isempty(ntt_sizes) || println("\ncrossover: Karatsuba vs fp NTT")
     sweep(ntt_sizes, n -> begin
         a = rlimbs(n); r = Memory{Limb}(undef, 2n)
-        s = Memory{Limb}(undef, sqr_scratch_len(n))
-        ["kar" => (() -> @belapsed sqr_kar!($r, 0, $a, 0, $n, $s, 0)),
+        # the scratch malloc is timed, not hoisted: sqr! allocates it per call,
+        # and excluding it flatters Karatsuba enough to move the threshold
+        ["kar" => (() -> @belapsed sqr_kar!($r, 0, $a, 0, $n,
+                                            Memory{Limb}(undef, sqr_scratch_len($n)), 0)),
          "ntt" => (() -> @belapsed sqr_fpntt2!($r, 0, $a, 0, $n))]
     end; unit = 1e6, u = "us")
 end

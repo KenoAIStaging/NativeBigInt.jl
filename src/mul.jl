@@ -11,18 +11,24 @@
 # basecase longer.
 const MUL_KARATSUBA_THRESHOLD = 29
 const SQR_KARATSUBA_THRESHOLD = 52
-# Karatsuba → two-prime fp NTT: balanced, the NTT ties Karatsuba at ~224
-# limbs and wins at every size above (worst post-transform-step band ~0.90,
-# 10-30% wins through 240-256 that a higher cut would forfeit).  The
-# two-prime engine also wins over single-prime at every size above this
-# line (its transforms are 2/2.5 the points since b ≈ 43 vs ≈ 17-24; only
-# linear overhead ever favored single-prime), so dispatch is fp2-only.
+# Karatsuba → two-prime fp NTT.  The two-prime engine wins over single-prime at
+# every size above this line (its transforms are 2/2.5 the points since b ≈ 43
+# vs ≈ 17-24; only linear overhead ever favored single-prime), so dispatch is
+# fp2-only.
+#
+# mul! selects on m + n, and a 2D (m, n) sweep confirms that shape: from 1:1 to
+# 8:1 the crossover sits between 240 total limbs (classical wins everywhere,
+# 1.01-1.09) and 248-256 (NTT wins or ties, 0.83-1.00) — hence 124.  Both sides
+# there pay their per-call scratch malloc as mul! does; hoisting Karatsuba's out
+# flatters it enough to move this constant by ~25 limbs.
 # For unbalanced operands the NTT needs the smaller one substantial (the
 # chunked Karatsuba path is ~max·min^0.585 while the NTT pays for the
 # combined length); at min = 64 the admitted region wins throughout
-# (0.74-0.91 at n = 64 across m = 512..8192; n = 48 still loses 1.02-1.21).
+# (0.74-0.91 at n = 64 across m = 512..8192; n = 48 loses out to 8:1).
+# Squaring crosses later (~152: sqr_kar! saves half the classical work while
+# the NTT saves only one of its three packs), so its cut stays at 160.
 const MUL_FPNTT_MIN = 64         # smaller operand at least this many limbs
-const MUL_FPNTT_THRESHOLD = 152  # average operand at least this many limbs
+const MUL_FPNTT_THRESHOLD = 124  # average operand at least this many limbs
 const SQR_FPNTT_THRESHOLD = 160  # operand at least this many limbs
 
 # Value comparison of la-limb a vs lb-limb b (la >= lb): strip a's zero top

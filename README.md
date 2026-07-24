@@ -33,7 +33,7 @@ Dispatch thresholds are benchmark-tuned (`bench/bench_kernels.jl`).
 
 - **Multiplication (`src/mul.jl`):** subtractive Karatsuba (threshold ~29
   limbs) with a general unbalanced-operand path; `mul!`/`sqr!` hand off to
-  the fp NTT at ~152 (mul) / 160 (sqr) balanced limbs. The NTT benchmarks
+  the fp NTT at ~124 (mul) / 160 (sqr) balanced limbs. The NTT benchmarks
   better than Toom-3 at every size (and thus presumably better than the
   higher-degree Toom variants), so no Toom layer exists. `mullo!`/`sqrlo!`
   are exact low short products (result mod β^k): truncated paired-row
@@ -137,15 +137,15 @@ normalized-divisor level step and pool-sized allocations closed the former
 ~40% mid-range gap. Decimal `string`/`parse` are supported and benchmarked
 in `bench_highlevel.jl` but slower than GMP's.
 
-At the kernel level, Karatsuba carries ~2k–10k bits at rough GMP parity
+At the kernel level, Karatsuba carries ~2k–8k bits at rough GMP parity
 (0.95–1.09× against `__gmpn_mul`, trading blows with GMP's hand-tuned Toom
-assembly), and the two-prime fp NTT takes over at ~10k bits already ahead
+assembly), and the two-prime fp NTT takes over at ~8k bits already ahead
 (`bench/bench_kernels.jl mul`, AVX-512 machine; ratio is `mul!` /
 `__gmpn_mul` on two equal operands):
 
 | bits | 10k  | 16k  | 33k  | 49k  | 66k  | 98k  | 131k | 262k | 524k | 2.1M | 16.8M | 268M |
 |------|------|------|------|------|------|------|------|------|------|------|-------|------|
-| `*`  | 0.90 | 0.68 | 0.52 | 0.46 | 0.38 | 0.35 | 0.30 | 0.29 | 0.25 | 0.27 | 0.25  | 0.46 |
+| `*`  | 0.90 | 0.69 | 0.50 | 0.46 | 0.37 | 0.34 | 0.29 | 0.29 | 0.24 | 0.27 | 0.27  | 0.43 |
 
 The lead reaches 2–4× from ~35k bits up, including the range where GMP has
 switched to its own Schönhage–Strassen FFT. Squaring crosses over at the

@@ -49,7 +49,7 @@ cover:
 - **Dispatch thresholds live at the mpn layer** (`src/mul.jl`,
   `src/div.jl`, `src/gcd.jl`), never at the NBig level, and are
   benchmark-tuned: Karatsuba ~29 limbs (`bench_kernels.jl kar`), fp NTT
-  ~152 balanced limbs, divide-and-conquer division `DC_DIV_THRESHOLD` = 100
+  ~124 balanced limbs, divide-and-conquer division `DC_DIV_THRESHOLD` = 100
   (`bench_kernels.jl dc`), subquadratic HGCD gcd `GCD_DC_THRESHOLD` = 300
   / `GCDEXT_DC_THRESHOLD` = 250 / `HGCD_THRESHOLD` = 120
   (`bench_kernels.jl gcd`).
