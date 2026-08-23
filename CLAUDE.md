@@ -22,7 +22,7 @@ julia --project=bench bench/bench_kernels.jl <family> [sizes] # kernel/threshold
 ```
 
 `bench/bench_kernels.jl` takes a family (`micro`, `mul`, `sqr`, `div`, `kar`,
-`dc`, `gcd`, `mullo`, `barrett`, `sqrt`) plus optional sizes; run it with no
+`dc`, `gcd`, `barrett`, `sqrt`) plus optional sizes; run it with no
 args for the family list. `bench/bench_highlevel.jl` takes optional op filters.
 
 There is no build/lint step — it's a plain Julia package.

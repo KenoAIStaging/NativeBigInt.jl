@@ -13,7 +13,6 @@
 #   kar      KARATSUBA_THRESHOLD sweep (mul_kar! vs gmp)
 #   dc       DC_DIV_THRESHOLD sweep (divrem_dc!/bc! vs gmp)
 #   gcd      subquadratic gcd/gcdx threshold sweep (Lehmer vs DC vs gmp)
-#   mullo    mullo!/sqrlo! sweep vs the full product they replace
 #   barrett  BARRETT_THRESHOLD / BARRETT_EVEN_THRESHOLD sweep (powermod_limbs)
 #   sqrt     SQRT_DIVAPPR_THRESHOLD sweep (isqrt divappr vs exact vs gmp)
 #   invert   INV_NEWTON_THRESHOLD sweep (invertappr! basecase vs Newton step)
@@ -30,8 +29,7 @@ using NativeBigInt: Limb,
     lshift!, rshift!, mul!, sqr!, mul_kar!, sqr_basecase!, sqr_kar!,
     sqr_fpntt2!, kar_scratch_len, sqr_scratch_len, MUL_FPNTT_THRESHOLD,
     divrem!, divrem_1!, divrem_dc!, divrem_bc!, invert_pi1, gcd!, gcdext!,
-    mullo!, sqrlo!, mullo_basecase!, sqrlo_basecase!, mullo_scratch_len,
-    sqrlo_scratch_len, powermod_limbs, invertappr!, invertappr_scratch_len,
+    powermod_limbs, invertappr!, invertappr_scratch_len,
     mu_divrem!, mu_divrem_scratch_len,
     fp_ntt_plan, fp_ntt_fwd!, fp_ntt_rev!, FP_CTX1, fp_prime, two_adicity
 
@@ -211,27 +209,6 @@ function run_gcd(sizes)
     end; unit = 1e6, u = "us")
 end
 
-function run_mullo(sizes)
-    println("mullo!/mullo_basecase! vs full mul!:")
-    sweep(sizes, k -> begin
-        a = rlimbs(k); b = rlimbs(k); r = Memory{Limb}(undef, 2k + 2)
-        ms = Memory{Limb}(undef, max(1, mullo_scratch_len(k)))
-        cs = ["mul!" => (() -> @belapsed mul!($r, 0, $a, 0, $k, $b, 0, $k)),
-              "mullo!" => (() -> @belapsed mullo!($r, 0, $a, 0, $k, $b, 0, $k, $k, $ms, 0))]
-        k <= 320 && push!(cs, "bc" => (() -> @belapsed mullo_basecase!($r, 0, $a, 0, $k, $b, 0, $k, $k)))
-        cs
-    end)
-    println("\nsqrlo!/sqrlo_basecase! vs full sqr!:")
-    sweep(sizes, k -> begin
-        a = rlimbs(k); r = Memory{Limb}(undef, 2k + 2)
-        ss = Memory{Limb}(undef, max(1, sqrlo_scratch_len(k)))
-        cs = ["sqr!" => (() -> @belapsed sqr!($r, 0, $a, 0, $k)),
-              "sqrlo!" => (() -> @belapsed sqrlo!($r, 0, $a, 0, $k, $k, $ss, 0))]
-        k <= 320 && push!(cs, "bc" => (() -> @belapsed sqrlo_basecase!($r, 0, $a, 0, $k, $k)))
-        cs
-    end)
-end
-
 # barrett: powermod_limbs with Barrett forced off (cur, the reference) vs on
 # (bar), per parity. Fixed 512-bit exponent keeps the mul/reduce count per k
 # constant, so the bar/cur ratio isolates the reduction cost.
@@ -370,7 +347,6 @@ const FAMILIES = Dict(
     "kar"     => (run_kar,     [32, 48, 64, 80, 96, 128, 192, 256]),
     "dc"      => (run_dc,      [32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048]),
     "gcd"     => (run_gcd,     Int[]),
-    "mullo"   => (run_mullo,   [16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 256, 320, 384, 448, 512, 640, 768]),
     "barrett" => (run_barrett, [4, 8, 12, 16, 20, 24, 28, 32, 40, 48, 64, 80, 96, 128, 192, 256]),
     "sqrt"    => (run_sqrt,    Int[]),
     "invert"  => (run_invert,  [4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024]),

@@ -471,3 +471,98 @@ function mu_divrem!(q::Memory{Limb}, qo::Int, r::Memory{Limb}, ro::Int,
     end
     return nothing
 end
+
+# ---- Barrett (mu) reduction ------------------------------------------------
+# T mod m for a *fixed* modulus: one reciprocal built per modulus and reused
+# across every product, where mu_divrem! rebuilds one per call. That is the
+# shape powermod_limbs needs — ~630 reductions per setup for a 512-bit exponent
+# — and the only reason a separate entry point exists at all.
+#
+# Two multiplications per reduction (the estimate and q̂·d), same as a
+# hand-rolled Barrett (HAC 14.42), but sharing invertappr! and mu_div_step!
+# with the division tier instead of carrying a second reciprocal convention.
+
+# powermod_limbs switches its reduction to Barrett at these modulus sizes
+# (limbs), tuned by bench/bench_kernels.jl barrett. The baselines differ by
+# parity, so the crossovers do too: Montgomery redc! (odd m) is a single
+# schoolbook addmul sweep, while divrem! (even m) rides the dc/Barrett division
+# tiers and holds out longer.
+#
+# mu_reduce!/baseline, 512-bit exponent, by modulus limbs k:
+#
+#   odd   40    48    56    64    72    80    88    96    112   128   160   192
+#         1.24  0.94  1.15  1.03  0.98  1.05  1.09  0.85  0.95  0.78  0.69  0.64
+#
+#   even  40    48    56    64    72    80    88    96    112   128   160   192
+#         1.22  1.19  1.10  1.27  1.25  1.13  1.19  1.12  1.12  1.06  0.96  0.96
+#         ... 224: 0.81, 256: 0.75, 384: 0.66, 512: 0.55
+#
+# Both values are the first size at or above which every measured point wins,
+# not a fitted crossover: the odd band from 48 to 88 swings +-15% with no trend
+# (the two sides step on different boundaries -- mul!'s Karatsuba/NTT admission
+# against redc!'s smooth schoolbook), so nothing inside it is defensible. Noise
+# here is ~4%: even k = 192 measured 0.96 and 1.00 in two runs.
+#
+# Both moved with the switch from the old hand-rolled Barrett to mu_reduce!:
+# odd 68 -> 96 (68 sat inside the oscillating band on unmeasured ground), even
+# 240 -> 160 (the cheaper invertappr! setup pulled the crossover down).
+const BARRETT_THRESHOLD = 96
+const BARRETT_EVEN_THRESHOLD = 160
+
+# Per-modulus reduction state. Concrete fields (never a Union) so the caller's
+# hot loop stays type-stable; the unused case is an EMPTY_LIMBS dummy.
+struct MuReduce
+    l::Int                  # normalizing shift of m
+    mp::Memory{Limb}        # m << l: k limbs, top bit set
+    iv::Memory{Limb}        # invertappr! of mp, k limbs
+    q::Memory{Limb}         # discarded quotient, k limbs
+    u::Memory{Limb}         # shifted numerator, 2k limbs, destroyed per call
+    scratch::Memory{Limb}   # mu_div_step! working space
+end
+
+mu_reduce_empty() =
+    MuReduce(0, EMPTY_LIMBS, EMPTY_LIMBS, EMPTY_LIMBS, EMPTY_LIMBS, EMPTY_LIMBS)
+
+# Once-per-modulus setup for the k-limb m (m[k] ≠ 0, k ≥ 2). Normalizing here
+# rather than per reduction is what lets invertappr! be called once: its Newton
+# derivation needs a top-bit-set divisor, but the shift is a property of m
+# alone.
+function mu_reduce_setup(m::Memory{Limb}, mo::Int, k::Int)
+    l = leading_zeros(@inbounds m[mo+k])
+    mp = Memory{Limb}(undef, k)
+    if l == 0
+        copyto!(mp, 1, m, mo + 1, k)
+    else
+        lshift!(mp, 0, m, mo, k, l)
+    end
+    iv = Memory{Limb}(undef, k)
+    invertappr!(iv, 0, mp, 0, k)
+    return MuReduce(l, mp, iv, Memory{Limb}(undef, k), Memory{Limb}(undef, 2k),
+                    Memory{Limb}(undef, mu_div_step_scratch_len(k)))
+end
+
+# r[1..k] = T mod m (unnormalized), T = t[to+1..to+2k].
+#
+# Requires T < m·β^k, which is narrower than a general T < β^2k: it is
+# mu_div_step!'s U < d·β^s precondition at s = k, and it is what makes this one
+# block instead of two. powermod's T = x·y with x, y < m satisfies it (T < m²
+# ≤ m·β^k) — a caller with arbitrary T < β^2k must use divrem! instead.
+#
+# Working in the shifted domain costs two O(k) passes against the reduction's
+# own 2·M(k): T' = T·2^l stays inside 2k limbs (T' < m·m' < β^2k), and
+# T' mod m' = (T mod m)·2^l shifts straight back out. r must not alias t.
+function mu_reduce!(r::Memory{Limb}, ro::Int, t::Memory{Limb}, to::Int, k::Int,
+                    st::MuReduce)
+    if st.l == 0
+        copyto!(st.u, 1, t, to + 1, 2k)
+    else
+        lshift!(st.u, 0, t, to, 2k, st.l)
+    end
+    mu_div_step!(st.q, 0, st.u, 0, k, st.mp, 0, k, st.iv, 0, k, st.scratch, 0)
+    if st.l == 0
+        copyto!(r, ro + 1, st.u, 1, k)
+    else
+        rshift!(r, ro, st.u, 0, k, st.l)
+    end
+    return nothing
+end

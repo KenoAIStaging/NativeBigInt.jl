@@ -35,12 +35,10 @@ Dispatch thresholds are benchmark-tuned (`bench/bench_kernels.jl`).
   limbs) with a general unbalanced-operand path; `mul!`/`sqr!` hand off to
   the fp NTT at ~124 (mul) / 160 (sqr) balanced limbs. The NTT benchmarks
   better than Toom-3 at every size (and thus presumably better than the
-  higher-degree Toom variants), so no Toom layer exists. `mullo!`/`sqrlo!`
-  are exact low short products (result mod β^k): truncated paired-row
-  basecases at 0.55–0.75× the full product deep into the Karatsuba range, a
-  Mulders split (~0.69k full low block + two recursive cross products) above
-  `MULLO_BASECASE_THRESHOLD`/`SQRLO_BASECASE_THRESHOLD`, and plain `mul!` +
-  discard once the balanced product reaches the NTT.
+  higher-degree Toom variants), so no Toom layer exists. There is no short-
+  product (Mulders) layer either: `mullo!`/`sqrlo!` existed but every
+  potential caller sits above the NTT crossover, where a truncated product
+  saves nothing, so they were removed (see git history).
 
 - **fp NTT multiplication (`src/fpntt.jl`):** the sole large-size engine —
   number-theoretic transforms computed entirely in `Float64` in the style of
@@ -176,5 +174,5 @@ that fit in memory.
 
 Kernel- and threshold-level benchmarks against GMP's `__gmpn_*` functions
 live in `bench/bench_kernels.jl`, a family-selecting driver (`micro`,
-`mul`, `sqr`, `div`, `kar`, `dc`, `gcd`, `mullo`, `barrett`, `sqrt`); run
+`mul`, `sqr`, `div`, `kar`, `dc`, `gcd`, `barrett`, `sqrt`); run
 it with no args for the family list.

@@ -129,94 +129,6 @@ using NativeBigInt: MUL_FPNTT_THRESHOLD, SQR_FPNTT_THRESHOLD, sqr!
     end
 end
 
-using NativeBigInt: mullo!, sqrlo!, mullo_scratch_len, sqrlo_scratch_len,
-    MULLO_BASECASE_THRESHOLD, SQRLO_BASECASE_THRESHOLD, MULLO_FULL_THRESHOLD,
-    SQRLO_FULL_THRESHOLD
-
-@testset "mullo!/sqrlo! low short products" begin
-    rng = MersenneTwister(0x10c4)
-    β = big(1) << 64
-
-    # exact low-k limbs; r gets k+2 limbs of capacity (top two are clobber
-    # slack per the contract), sentinel-filled so stale content is caught
-    function checkmullo(la, lb, k, a, b; scratch::Bool=false)
-        r = amem(fill(0xdeadbeefdeadbeef, k + 2))
-        if scratch
-            so = 3   # nonzero offset
-            s = Memory{UInt64}(undef, so + mullo_scratch_len(k))
-            mullo!(r, 0, a, 0, la, b, 0, lb, k, s, so)
-        else
-            mullo!(r, 0, a, 0, la, b, 0, lb, k)
-        end
-        @test atoref(r, 0, k) == (atoref(a, 0, la) * atoref(b, 0, lb)) % β^k
-    end
-    function checksqrlo(la, k, a; scratch::Bool=false)
-        r = amem(fill(0xdeadbeefdeadbeef, k + 2))
-        if scratch
-            so = 3
-            s = Memory{UInt64}(undef, so + sqrlo_scratch_len(k))
-            sqrlo!(r, 0, a, 0, la, k, s, so)
-        else
-            sqrlo!(r, 0, a, 0, la, k)
-        end
-        @test atoref(r, 0, k) == atoref(a, 0, la)^2 % β^k
-    end
-
-    Tb = MULLO_BASECASE_THRESHOLD
-    Ts = SQRLO_BASECASE_THRESHOLD
-    Tf = MULLO_FULL_THRESHOLD
-    Tfs = SQRLO_FULL_THRESHOLD
-
-    # k spanning tiny sizes, the basecase → Mulders crossover, the Mulders
-    # band, and the full-product fallback; shapes: balanced, unbalanced,
-    # operands longer than k (clamping), product shorter than k (zero fill),
-    # k within two limbs of the full product (r-slack fallback)
-    for k in (1, 2, 3, 5, 8, Tb - 1, Tb, Tb + 1, 2Tb + 3, Tf - 1, Tf, Tf + 17)
-        shapes = [(k, k), (k, max(1, k ÷ 2)), (k, max(1, 2k ÷ 3)),
-                  (max(1, k - 1), max(1, k - 1)),
-                  (k, 1), (k, 2), (max(1, k ÷ 3), max(1, k ÷ 3)),
-                  (k + 4, k + 4), (2k, max(1, k ÷ 2))]
-        for (la, lb) in shapes, trial in 1:2
-            a = amem(rand(rng, UInt64, la)); b = amem(rand(rng, UInt64, lb))
-            checkmullo(la, lb, k, a, b)
-            checkmullo(lb, la, k, b, a)           # argument-order symmetry
-        end
-    end
-    # all-ones adversarial: maximum carry chains across the truncation cut
-    for k in (Tb - 1, Tb + 1, 2Tb + 3), (la, lb) in ((k, k), (k, k ÷ 2 + 1))
-        a = amem(fill(typemax(UInt64), la)); b = amem(fill(typemax(UInt64), lb))
-        checkmullo(la, lb, k, a, b)
-    end
-    # caller-provided scratch at an offset matches the allocating form
-    for k in (Tb + 5, 2Tb + 3, Tf + 17), (la, lb) in ((k, k), (k, k ÷ 2 + 1))
-        a = amem(rand(rng, UInt64, la)); b = amem(rand(rng, UInt64, lb))
-        checkmullo(la, lb, k, a, b; scratch=true)
-    end
-
-    # sqrlo: same sweep; la relative to k exercises the truncated triangle
-    # (k ≤ 2la - 3), the r-slack full square (2la ≤ k + 2), and zero fill
-    for k in (1, 2, 3, 5, 8, Ts - 1, Ts, Ts + 1, 2Ts + 3, Tfs - 1, Tfs, Tfs + 17)
-        for la in unique((k, max(1, k - 1), max(1, 2k ÷ 3), max(1, (k + 2) ÷ 2),
-                          max(1, k ÷ 2), max(1, k ÷ 3), k + 4)), trial in 1:2
-            checksqrlo(la, k, amem(rand(rng, UInt64, la)))
-        end
-    end
-    for k in (Ts - 1, Ts + 1, 2Ts + 3), la in (k, 2k ÷ 3 + 2)
-        checksqrlo(la, k, amem(fill(typemax(UInt64), la)))
-    end
-    for k in (Ts + 5, 2Ts + 3, Tfs + 17), la in (k, 2k ÷ 3 + 2)
-        checksqrlo(la, k, amem(rand(rng, UInt64, la)); scratch=true)
-    end
-
-    # random shape fuzz across the whole dispatch surface
-    for trial in 1:200
-        k = rand(rng, 1:3Tb)
-        la = rand(rng, 1:k + 8); lb = rand(rng, 1:k + 8)
-        checkmullo(la, lb, k, amem(rand(rng, UInt64, la)), amem(rand(rng, UInt64, lb)))
-        checksqrlo(la, k, amem(rand(rng, UInt64, la)))
-    end
-end
-
 @testset "divrem! multi-limb" begin
     rng = MersenneTwister(23)
 
@@ -383,7 +295,7 @@ end
     end
 end
 
-using NativeBigInt: barrett_setup, barrett_reduce!, powermod_limbs,
+using NativeBigInt: mu_reduce_setup, mu_reduce!, powermod_limbs,
     BARRETT_THRESHOLD, BARRETT_EVEN_THRESHOLD
 
 @testset "invertappr!" begin
@@ -560,52 +472,57 @@ end
     end
 end
 
-@testset "barrett_reduce!" begin
+@testset "mu_reduce!" begin
     rng = MersenneTwister(0xba44e77)
 
-    function checkbar(Tref::BigInt, mref::BigInt, k::Int)
+    # mu_reduce! requires T < m·β^k (mu_div_step!'s U < d·β^s at s = k), which
+    # is narrower than the general T < β^2k the old hand-rolled Barrett took: a
+    # caller with arbitrary T must go through divrem!. Every T below respects
+    # it, and the helper asserts it rather than trusting the construction.
+    # k >= 2 likewise: the reduction is only reachable above BARRETT_THRESHOLD.
+    function checkmu(Tref::BigInt, mref::BigInt, k::Int)
+        @assert k >= 2 && Tref < mref * (big(1) << 64k)
         mbuf = afrombig(mref, k)
-        mu, lmu, scratch = barrett_setup(mbuf, 0, k)
-        @test atoref(mu, 0, lmu) == (big(1) << (128k)) ÷ mref
+        st = mu_reduce_setup(mbuf, 0, k)
+        @test atoref(st.mp, 0, k) == mref << leading_zeros(mbuf[k])  # normalized
         r = Memory{UInt64}(undef, k)
-        barrett_reduce!(r, 0, afrombig(Tref, 2k), 0, mbuf, 0, k, mu, lmu, scratch, 0)
+        mu_reduce!(r, 0, afrombig(Tref, 2k), 0, k, st)
         @test atoref(r, 0, k) == mod(Tref, mref)
+        @test atoref(mbuf, 0, k) == mref                             # m read-only
     end
 
-    # random sweep: any T < β^2k, m with uniform top limb
+    # the real usage shape: T = x·y with x, y < m
     for trial in 1:200
-        k = rand(rng, 1:40)
+        k = rand(rng, 2:40)
         mref = rand(rng, big(1) << (64k - 64):(big(1) << 64k) - 1)
         mref <= 1 && (mref = big(2))
-        checkbar(rand(rng, big(0):(big(1) << 128k) - 1), mref, k)
+        checkmu(rand(rng, big(0):mref-1) * rand(rng, big(0):mref-1), mref, k)
     end
 
-    # real usage shape (T = x·y with x, y < m) plus targeted 0/1/2-correction
-    # values: T = q·m + r with r near 0 and near m
+    # maximal quotient (q = β^k - 1 is the largest T < m·β^k allows) with the
+    # remainder pinned at each end, to drive the 0/1/2-correction arms
     for trial in 1:100
-        k = rand(rng, 1:30)
+        k = rand(rng, 2:30)
         mref = rand(rng, big(1) << (64k - 64):(big(1) << 64k) - 1)
         mref <= 1 && (mref = big(3))
-        x = rand(rng, big(0):mref-1)
-        y = rand(rng, big(0):mref-1)
-        checkbar(x * y, mref, k)
-        q = (big(1) << 128k - 1) ÷ mref - 1
-        checkbar(q * mref, mref, k)                      # r = 0
-        checkbar(q * mref + rand(rng, big(0):mref-1), mref, k)
-        checkbar(q * mref + mref - 1, mref, k)           # r = m - 1
+        q = (big(1) << 64k) - 1
+        checkmu(q * mref, mref, k)                       # r = 0
+        checkmu(q * mref + rand(rng, big(0):mref-1), mref, k)
+        checkmu(q * mref + mref - 1, mref, k)            # r = m - 1
+        checkmu((q - 1) * mref + mref - 1, mref, k)
     end
 
-    # edges: m with minimal top limb, m = β^(k-1) (μ takes k+2 limbs),
-    # m = β^k - 1, T near β^2k, T < m, T = 0
-    for k in (1, 2, 3, 7, 20)
+    # edges: m with minimal top limb (largest normalizing shift), m = β^(k-1),
+    # m = β^k - 1 (shift 0); T at the top of the contract, T < m, T = 0
+    for k in (2, 3, 7, 20)
         small_top = (big(1) << (64k - 64)) | rand(rng, big(0):(big(1) << (64k - 64)) - 1)
         for mref in (small_top, big(1) << (64k - 64), (big(1) << 64k) - 1)
             mref <= 1 && continue
-            checkbar((big(1) << 128k) - 1, mref, k)
-            checkbar(big(0), mref, k)
-            checkbar(mref - 1, mref, k)
-            checkbar(mref + 1, mref, k)
-            checkbar((mref - 1)^2, mref, k)
+            checkmu(mref * (big(1) << 64k) - 1, mref, k) # largest legal T
+            checkmu(big(0), mref, k)
+            checkmu(mref - 1, mref, k)
+            checkmu(mref + 1, mref, k)
+            checkmu((mref - 1)^2, mref, k)
         end
     end
 end
