@@ -64,11 +64,31 @@ Dispatch thresholds are benchmark-tuned (`bench/bench_kernels.jl`).
   `divrem_bc!` below ~100 limbs, GMP-`dcpi1`-style divide-and-conquer
   division above (recursive 2n/n blocks over `mul!`, so it inherits
   Karatsuba and the NTT; 0.82–0.96× GMP's `mpn_tdiv_qr` from the crossover
-  through at least 2048 limbs). `divappr!` is the quotient-only variant: a
+  through at least 2048 limbs). The divisor and quotient sides are gated
+  separately: `DC_DIV_THRESHOLD` on the divisor, the lower
+  `DC_DIV_PARTIAL_THRESHOLD` on the quotient, since the leading partial
+  block's cross-product arm beats schoolbook as soon as `mul!` is
+  subquadratic. Sharing one threshold cost up to 2.1× on short quotients over
+  large divisors. `divappr_dc!`/`divappr_bc!` are the quotient-only
+  engines (driven directly by `sqrt.jl`, the only consumer): a
   one-sided approximate quotient (never below the true one, within
-  `DIVAPPR_ERR = 32` ulps) that skips all remainder work, via a
+  ~20 ulps) that skips all remainder work, via a
   triangle-truncated basecase and a dc recursion that peels the top quotient
   half exactly.
+
+- **Barrett division (`src/invert.jl`):** `invertappr!` is a multi-limb
+  approximate reciprocal — the Newton-doubling generalization of the
+  `invert_limb`/`invert_pi1` kernels (GMP `mpn_invertappr`), one-sided and
+  within 1 ulp, recursing above `INV_NEWTON_THRESHOLD = 72` and otherwise
+  taking one direct 2n/n division. `mu_divrem!` (GMP `mpn_mu_div_qr`) builds
+  blocked Barrett division on it: two multiplications per quotient block
+  instead of dc division's recursive division per block, having paid for one
+  reciprocal up front. That makes it O(M(n)) against dc's O(M(n)·log n),
+  which is why `divrem!` dispatches to it once the reciprocal amortizes —
+  measured D/M rises 4.3 → 6.1 → 7.8 at 512/2048/8192 limbs. The crossover
+  moves with the *shape*, since the reciprocal is spread over
+  `k = ⌈qn/m⌉` blocks: 0.91× dc for a balanced 2m/m at 1024 limbs, 0.90× for
+  3m/m at 384, 0.87× for 5m/m at 256, improving to 0.40–0.68× by 4096.
 
 - **gcd (`src/gcd.jl`):** Lehmer gcd/gcdext (Knuth Algorithm L) on 126-bit
   leading windows — two bracket-verified single-word phases per window,
@@ -84,7 +104,7 @@ Dispatch thresholds are benchmark-tuned (`bench/bench_kernels.jl`).
   - *sqrt:* Karatsuba square root (Zimmermann), each level dividing the
     halved numerator by the top of the root buffer in place (no divisor
     construction or per-level renormalization). For `isqrt` above ~4k bits
-    the top level is root-only: `divappr!` with one guard limb plus a
+    the top level is root-only: the divappr engines with one guard limb plus a
     mantissa-interval certificate settles the root without computing the
     remainder or the final square, reconstructing them only in the ambiguous
     band (~2⁻⁵⁷ of inputs, plus perfect squares).

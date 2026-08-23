@@ -40,6 +40,21 @@ end
     end
 end
 
+@testset "isqrt Barrett top level" begin
+    # Two paths past the sweep above, which tops out at 560 limbs. hh ≈ n/4, so
+    # n ≈ 4100 puts the top level on Barrett with the reciprocal ladder at its
+    # from-scratch base (sqrt_build_inv!'s !seeded arm). The *seeded* arm — the
+    # widen-then-double step — needs two consecutive Barrett levels, i.e.
+    # hh ≥ MU_SQRT_THRESHOLD two levels running, which starts at n ≈ 8192.
+    rng = MersenneTwister(0x5137)
+    for n in (4100, 8200)
+        a = abs(diff_randbig(rng, n))
+        for x in (a, a^2 - 1, a^2)
+            @test BigInt(isqrt(NBig(x))) == isqrt(x)
+        end
+    end
+end
+
 @testset "differential gcd" begin
     rng = MersenneTwister(0x9cd)
     @test iszero(gcd(NBig(0), NBig(0)))

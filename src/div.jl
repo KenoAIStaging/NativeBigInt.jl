@@ -42,6 +42,14 @@ function divrem!(q::Memory{Limb}, qo::Int, r::Memory{Limb}, ro::Int,
         n > m && (@inbounds q[qo+2] = zero(Limb))
         return nothing
     end
+    # Barrett tier (mu_divrem!, defined in invert.jl — included after this file,
+    # which Julia resolves at call time). Taken only when we own the scratch:
+    # a caller-supplied buffer is sized for the dc path and mu_divrem! needs a
+    # larger one, so the one scratch-passing caller (sqrt.jl:105) stays on dc
+    # regardless of shape.
+    if scratch === nothing && mu_div_worthwhile(n - m + 1, m)
+        return mu_divrem!(q, qo, r, ro, a, ao, n, d, do_, m)
+    end
     l = leading_zeros(@inbounds d[do_+m])
     nn = n + 1
     if scratch === nothing
@@ -59,7 +67,7 @@ function divrem!(q::Memory{Limb}, qo::Int, r::Memory{Limb}, ro::Int,
     end
     v = @inbounds invert_pi1(dv[dvo+m], dv[dvo+m-1])
     # qh == 0 either way: Q < β^(nn-m)
-    if m >= DC_DIV_THRESHOLD && nn - m >= DC_DIV_THRESHOLD
+    if m >= DC_DIV_THRESHOLD && nn - m >= DC_DIV_PARTIAL_THRESHOLD
         divrem_dc!(q, qo, scratch, sco, nn, dv, dvo, m, v, DC_DIV_THRESHOLD,
                    scratch, sco + nn + m)
     else
@@ -74,9 +82,14 @@ function divrem!(q::Memory{Limb}, qo::Int, r::Memory{Limb}, ro::Int,
 end
 
 # Schoolbook → divide-and-conquer division crossover, in limbs (GMP's
-# DC_DIV_QR_THRESHOLD analogue; tuned by bench/bench_dc_thr.jl). divrem!
-# dispatches to divrem_dc! only when both the divisor and the quotient reach
-# it — a short quotient over a long divisor costs O(qn·m) either way.
+# DC_DIV_QR_THRESHOLD analogue; tuned by bench/bench_dc_thr.jl). It gates the
+# *divisor* side only: the quotient side uses the lower
+# DC_DIV_PARTIAL_THRESHOLD, because a short quotient over a long divisor does
+# NOT cost the same either way. Both arms are O(qn·m) in operation count, but
+# schoolbook spends it in row kernels while the leading-partial arm spends it
+# in mul!(qn, m-qn), which is subquadratic. Requiring qn >= 100 here used to
+# leave a cliff where a longer quotient divided faster (m = 1024: 27.2us at
+# qn = 96 against 14.7us at qn = 112).
 # Balanced 2m/m sweep: schoolbook wins through m = 96, ties at m = 128, and
 # falls behind from m = 192 (1.1-3x GMP by m = 2048 vs dc's 0.8-1.0x); as the
 # recursion cutoff, 100-110 also edges out lower values at large m.
@@ -127,17 +140,39 @@ function divrem_dc_n!(q::Memory{Limb}, qo::Int, u::Memory{Limb}, uo::Int,
     return qh
 end
 
+# Schoolbook → cross-product crossover for the *leading partial* block, which
+# is a different question from the balanced DC_DIV_THRESHOLD and needs its own
+# constant. The schoolbook arm costs O(s·m) with row-kernel constants; the
+# cross-product arm costs a cheap 2s/s division plus mul!(s, m-s), so it wins
+# as soon as mul! is subquadratic — a far lower bar than the balanced case,
+# and near-independent of m.
+#
+# Gating this on DC_DIV_THRESHOLD instead left a cliff where a *longer*
+# quotient divided faster. divrem! ns by quotient limbs, before → after:
+#
+#   qn        32      48      64      80      96      112
+#   m=1024  9288    14127   18635   24497   26611   14568
+#      ->   9288    12213   12224   12935   13505   14708
+#   m=2048 16611    28544   37362   42591   53662   26059
+#      ->  16982    23826   23575   24247   24928   26110
+#
+# 48 rather than 32: at 32 the cross-product arm is still behind (m = 2048 went
+# 16.6us -> 21.1us), and the crossover measures out at ~44.
+# Must stay >= 4 so divrem_dc_n!'s halves keep divrem_bc! at m >= 2.
+const DC_DIV_PARTIAL_THRESHOLD = 48
+
 # Leading partial quotient block: u[uo+1..uo+m+s] ÷ d (full m limbs), s <= m.
 # Writes q[qo+1..qo+s], leaves the m-limb remainder in u[uo+1..uo+m], returns
-# qh. s == m is the balanced step; small s stays schoolbook (O(s·m), one-off);
-# otherwise divide the top 2s limbs by the top s limbs of d, then subtract the
-# cross product q·d_lo with the same add-back repair (GMP mpn_dcpi1_div_qr's
-# qn < dn arm).
+# qh. s == m is the balanced step; very small s stays schoolbook (O(s·m),
+# one-off); otherwise divide the top 2s limbs by the top s limbs of d, then
+# subtract the cross product q·d_lo with the same add-back repair (GMP
+# mpn_dcpi1_div_qr's qn < dn arm).
 function divrem_dc_partial!(q::Memory{Limb}, qo::Int, u::Memory{Limb}, uo::Int,
                             d::Memory{Limb}, do_::Int, m::Int, s::Int, v::Limb,
                             scratch::Memory{Limb}, so::Int, thr::Int)
     s == m && return divrem_dc_n!(q, qo, u, uo, d, do_, m, v, scratch, so, thr)
-    s < thr && return divrem_bc!(q, qo, u, uo, m + s, d, do_, m, v)
+    s < min(thr, DC_DIV_PARTIAL_THRESHOLD) &&
+        return divrem_bc!(q, qo, u, uo, m + s, d, do_, m, v)
     qh = divrem_dc_n!(q, qo, u, uo + (m - s), d, do_ + (m - s), s, v, scratch, so, thr)
     if s >= m - s                                          # q × d_lo, m limbs
         mul!(scratch, so, q, qo, s, d, do_, m - s)
@@ -178,16 +213,9 @@ function divrem_dc!(q::Memory{Limb}, qo::Int, u::Memory{Limb}, uo::Int, nn::Int,
     return qh
 end
 
-# One-sided bound on divappr!'s quotient over-approximation, in ulps:
-# entry/per-level divisor truncation contributes ≤ 1 each (numerator ≤ β^qn·d
-# against a kept top ≥ β^(t-1), t = qn+2), the triangle basecase ≤ 2, and the
-# dc recursion halves the block per level — ≤ ~20 for any feasible size.
-# The differential test asserts the measured error never exceeds this.
-const DIVAPPR_ERR = Limb(32)
-
 # Approximate leading quotient block, no remainder: writes s quotient limbs q̂
 # for the top m+s live limbs of u by the m-limb normalized d, with
-# q_true ≤ q̂ ≤ q_true + E (E per DIVAPPR_ERR); u above uo is destroyed and
+# q_true ≤ q̂ ≤ q_true + E (E ≤ ~20, bounded in sqrt_root_cert); u above uo is destroyed and
 # holds nothing meaningful. Returns the extra top quotient bit/carry (the
 # over-approximation of a maximal true quotient can carry out; callers fold
 # it). Structure: truncate the divisor to its top s+2 limbs (only they can
@@ -239,48 +267,18 @@ function divappr_dc!(q::Memory{Limb}, qo::Int, u::Memory{Limb}, uo::Int, nn::Int
     return qh
 end
 
-# Approximate quotient, divrem!'s operand contract without the remainder:
-# a (n limbs) ÷ d (m limbs, d[m] ≠ 0), n ≥ m ≥ 1, writes n-m+1 quotient limbs
-# q̂ with floor(a/d) ≤ q̂ ≤ floor(a/d) + DIVAPPR_ERR; a is not modified. The
-# appended-zero normalization limb keeps even the over-approximated quotient
-# inside n-m+1 limbs (q < 2β^(qn-1) ≪ β^qn), so there is no carry to return.
-# scratch needs n + 1 + 3m limbs at sco (allocated when not passed).
-function divappr!(q::Memory{Limb}, qo::Int, a::Memory{Limb}, ao::Int, n::Int,
-                  d::Memory{Limb}, do_::Int, m::Int,
-                  scratch::Union{Memory{Limb},Nothing}=nothing, sco::Int=0)
-    qn = n - m + 1
-    if m > qn + 2
-        # only the top qn+2 divisor limbs can move the quotient by > 1 ulp;
-        # drop the rest along with the matching low numerator limbs
-        drop = m - (qn + 2)
-        return divappr!(q, qo, a, ao + drop, n - drop, d, do_ + drop, m - drop,
-                        scratch, sco)
-    end
-    if scratch === nothing
-        scratch = Memory{Limb}(undef, n + 1 + 3m)
-        sco = 0
-    end
-    if m <= 2 || magnitude_bits(a, ao, n) - magnitude_bits(d, do_, m) <= 2
-        # exact fast paths; remainder discarded into scratch
-        return divrem!(q, qo, scratch, sco, a, ao, n, d, do_, m, scratch, sco + m)
-    end
-    l = leading_zeros(@inbounds d[do_+m])
-    nn = n + 1
-    if l == 0
-        copyto!(scratch, sco + 1, a, ao + 1, n)
-        @inbounds scratch[sco+nn] = zero(Limb)
-        dv, dvo = d, do_
-    else
-        @inbounds scratch[sco+nn] = lshift!(scratch, sco, a, ao, n, l)
-        lshift!(scratch, sco + nn, d, do_, m, l)
-        dv, dvo = scratch, sco + nn
-    end
-    v = @inbounds invert_pi1(dv[dvo+m], dv[dvo+m-1])
-    if m >= DC_DIV_THRESHOLD && nn - m >= DC_DIV_THRESHOLD
-        divappr_dc!(q, qo, scratch, sco, nn, dv, dvo, m, v, DC_DIV_THRESHOLD,
-                    scratch, sco + nn + m)
-    else
-        divappr_bc!(q, qo, scratch, sco, nn, dv, dvo, m, v)
-    end
-    return nothing
-end
+# There is no divrem!-style wrapper around the divappr engines: the only
+# consumer is sqrt.jl, which drives divappr_dc!/divappr_bc! directly from its
+# own normalized numerator buffer (sqrt.jl:238-248). A wrapper existed and was
+# never called from anywhere but its test; test_algorithms.jl now carries an
+# equivalent driver so the engines keep their direct coverage over arbitrary
+# shapes. Two things that wrapper knew, worth keeping written down:
+#
+#   * Entry divisor truncation: with qn = n-m+1, only the top qn+2 divisor
+#     limbs can move the quotient by more than 1 ulp, so for m > qn+2 the rest
+#     can be dropped along with the matching low numerator limbs. That is what
+#     keeps divappr out of the short-quotient regime entirely (after the
+#     truncation qn >= m-2 always) — relevant if a Barrett tier is ever added
+#     here, since it would inherit a reciprocal of size min(m, qn+2).
+#   * The appended-zero normalization limb keeps even the over-approximated
+#     quotient inside n-m+1 limbs (q < 2β^(qn-1) ≪ β^qn), so no carry escapes.

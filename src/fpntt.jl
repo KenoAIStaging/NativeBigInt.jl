@@ -788,9 +788,13 @@ end
 # Each c1, u is pre-split into window halves lo = v << s, hi = v >> (64 - s) so
 # the scalar accumulate is pure add-with-carry, with s = (b·i) mod 64 data-
 # independent (the flush drops s by exactly 64).  The 128-bit window never
-# overflows: values are < 2^50, s < 64, and each flushed limb is final.  Note c1
-# must be canonicalized before fp_reduce(v1, F2), since v1 - p1 is a different
-# value mod p2.
+# overflows: values are < 2^50, s < 64, and each flushed limb is final.  This is
+# why both c1 and u must be canonical, not just balanced: they are streamed as
+# unsigned limb values (a negative one truncates to garbage, and the accumulate
+# has no borrow path).  Feeding a balanced c1 to the Garner step would not
+# perturb c itself — the resulting u picks up a compensating +1 mod p2 — but the
+# reconstruction c = c1 + p1·u only lands in [0, p1·p2) for canonical u when
+# c1 >= 0, so c1 < 0 with u = p2-1 wraps to c - p1·p2.
 
 # Unscale a raw value pair by 1/N and Garner-combine (scalar or VF8).
 @inline function fp_garner(w1, w2, n1, n1p, n2, n2p)

@@ -12,9 +12,6 @@ Random extension). Requires a recent Julia — it uses `Memory{UInt64}`.
 ## Commands
 
 ```bash
-# Run the full test suite (activates test deps: Test, Random)
-julia --project -e 'using Pkg; Pkg.test()'
-
 # Run a single test file — load the package, then include the file.
 # (test/runtests.jl just includes the per-area files under one @testset.)
 julia --project -e 'using NativeBigInt, Test, Random; include("test/test_kernels.jl")'
@@ -48,11 +45,9 @@ cover:
   (`bench/asm_dump.jl`).
 - **Dispatch thresholds live at the mpn layer** (`src/mul.jl`,
   `src/div.jl`, `src/gcd.jl`), never at the NBig level, and are
-  benchmark-tuned: Karatsuba ~29 limbs (`bench_kernels.jl kar`), fp NTT
-  ~124 balanced limbs, divide-and-conquer division `DC_DIV_THRESHOLD` = 100
-  (`bench_kernels.jl dc`), subquadratic HGCD gcd `GCD_DC_THRESHOLD` = 300
-  / `GCDEXT_DC_THRESHOLD` = 250 / `HGCD_THRESHOLD` = 120
-  (`bench_kernels.jl gcd`).
+  benchmark-tuned: the constants live in those files (Karatsuba, fp NTT,
+  divide-and-conquer division, subquadratic HGCD gcd) — retune them with
+  `bench_kernels.jl kar` / `dc` / `gcd`.
 - **Deleted algorithms:** Toom-3, the integer Goldilocks NTT (`src/ntt.jl`),
   and the single-prime fp pipeline were removed once the two-prime fp NTT
   beat them everywhere — git history has them; don't reintroduce variants

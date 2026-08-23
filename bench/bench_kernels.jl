@@ -16,6 +16,9 @@
 #   mullo    mullo!/sqrlo! sweep vs the full product they replace
 #   barrett  BARRETT_THRESHOLD / BARRETT_EVEN_THRESHOLD sweep (powermod_limbs)
 #   sqrt     SQRT_DIVAPPR_THRESHOLD sweep (isqrt divappr vs exact vs gmp)
+#   invert   INV_NEWTON_THRESHOLD sweep (invertappr! basecase vs Newton step)
+#   mudiv    MU_DIV_THRESHOLD sweep (divrem! vs mu_divrem!, balanced + long qn)
+#   dcpart   DC_DIV_PARTIAL_THRESHOLD sweep (divrem! over short qn, large m)
 #   radix    fp NTT fwd+rev ns/point per odd multiplier m (tunes ntt_len's
 #            family admission: a multiplier only deserves selection where its
 #            per-point cost stays below the padding it saves)
@@ -28,7 +31,8 @@ using NativeBigInt: Limb,
     sqr_fpntt2!, kar_scratch_len, sqr_scratch_len, MUL_FPNTT_THRESHOLD,
     divrem!, divrem_1!, divrem_dc!, divrem_bc!, invert_pi1, gcd!, gcdext!,
     mullo!, sqrlo!, mullo_basecase!, sqrlo_basecase!, mullo_scratch_len,
-    sqrlo_scratch_len, powermod_limbs,
+    sqrlo_scratch_len, powermod_limbs, invertappr!, invertappr_scratch_len,
+    mu_divrem!, mu_divrem_scratch_len,
     fp_ntt_plan, fp_ntt_fwd!, fp_ntt_rev!, FP_CTX1, fp_prime, two_adicity
 
 # large sizes are µs–ms scale; a modest per-measurement budget keeps sweeps quick
@@ -287,6 +291,75 @@ function run_radix(targets)
     end
 end
 
+# invert: INV_NEWTON_THRESHOLD sweep. "bc" forces the direct 2n/n division
+# basecase (thr = n); "newton" forces exactly one Newton level on top of that
+# basecase (thr = n-1), which is the marginal decision the threshold makes.
+# The threshold is the smallest n where newton wins — self-similar, so once it
+# pays it keeps paying. "full" (thr = 1, recurse to invert_limb) is shown as a
+# sanity check that the recursion isn't pathological at small n.
+function run_invert(sizes)
+    sweep(sizes, n -> begin
+        d = rlimbs(n)
+        d[n] |= typemax(Limb) - (typemax(Limb) >> 1)   # normalize
+        ip = Memory{Limb}(undef, n)
+        sbc = Memory{Limb}(undef, invertappr_scratch_len(n, n))
+        snw = Memory{Limb}(undef, invertappr_scratch_len(n, max(n - 1, 1)))
+        sfl = Memory{Limb}(undef, invertappr_scratch_len(n, 1))
+        nm1 = max(n - 1, 1)
+        ["bc"     => (() -> @belapsed invertappr!($ip, 0, $d, 0, $n, $sbc, 0, $n)),
+         "newton" => (() -> @belapsed invertappr!($ip, 0, $d, 0, $n, $snw, 0, $nm1)),
+         "full"   => (() -> @belapsed invertappr!($ip, 0, $d, 0, $n, $sfl, 0, 1))]
+    end)
+end
+
+# dcpart: DC_DIV_PARTIAL_THRESHOLD sweep. divrem! on a fixed large divisor
+# across short quotient lengths, which is where the leading-partial block
+# picks between the schoolbook and cross-product arms. Sizes are qn; the
+# divisor sizes are fixed below. A monotone row is the goal — a dip means the
+# threshold is letting a longer quotient take a faster path than a shorter one.
+function run_dcpart(sizes)
+    for m in (1024, 2048)
+        println("m = $m, by quotient limbs:")
+        sweep(sizes, qn -> begin
+            n = m + qn - 1
+            a = rlimbs(n)
+            d = rlimbs(m)
+            d[m] |= typemax(Limb) - (typemax(Limb) >> 1)
+            q = Memory{Limb}(undef, n - m + 1)
+            r = Memory{Limb}(undef, m)
+            sd = Memory{Limb}(undef, n + 1 + 2m)
+            ["divrem!" => (() -> @belapsed divrem!($q, 0, $r, 0, $a, 0, $n, $d, 0, $m, $sd, 0))]
+        end)
+        println()
+    end
+end
+
+# mudiv: MU_DIV_THRESHOLD sweep. divrem! (schoolbook/dc) against mu_divrem!
+# (Barrett) at the same shape. Sizes are the DIVISOR length m. Balanced 2m/m is
+# where the reciprocal is paid once per division and amortizes least; the 5m/m
+# row is the long-quotient case where one reciprocal serves several blocks and
+# the crossover should come earlier.
+function run_mudiv(sizes)
+    row(mult) = m -> begin
+        n = mult * m
+        a = rlimbs(n)
+        d = rlimbs(m)
+        d[m] |= typemax(Limb) - (typemax(Limb) >> 1)   # normalized
+        q = Memory{Limb}(undef, n - m + 1)
+        r = Memory{Limb}(undef, m)
+        sd = Memory{Limb}(undef, n + 1 + 2m)
+        smu = Memory{Limb}(undef, mu_divrem_scratch_len(n, m))
+        ["divrem!" => (() -> @belapsed divrem!($q, 0, $r, 0, $a, 0, $n, $d, 0, $m, $sd, 0)),
+         "mu" => (() -> @belapsed mu_divrem!($q, 0, $r, 0, $a, 0, $n, $d, 0, $m, $smu, 0))]
+    end
+    println("balanced 2m/m (k=1 block):")
+    sweep(sizes, row(2))
+    println("\n3m/m (k=2 blocks):")
+    sweep(sizes, row(3))
+    println("\nlong quotient 5m/m (k=4 blocks):")
+    sweep(sizes, row(5))
+end
+
 # ---- dispatch --------------------------------------------------------------
 const FAMILIES = Dict(
     "micro"   => (run_micro,   [1, 2, 4, 8, 16, 32, 64, 128, 256]),
@@ -300,6 +373,9 @@ const FAMILIES = Dict(
     "mullo"   => (run_mullo,   [16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 256, 320, 384, 448, 512, 640, 768]),
     "barrett" => (run_barrett, [4, 8, 12, 16, 20, 24, 28, 32, 40, 48, 64, 80, 96, 128, 192, 256]),
     "sqrt"    => (run_sqrt,    Int[]),
+    "invert"  => (run_invert,  [4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024]),
+    "mudiv"   => (run_mudiv,   [64, 128, 192, 256, 384, 512, 768, 1024, 2048, 4096]),
+    "dcpart"  => (run_dcpart,  [16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 256]),
 )
 
 function main(args)

@@ -1,6 +1,8 @@
 # Algorithm tests
 using NativeBigInt: Limb, add_carry!, cmp_padded, abs_diff!, kar_scratch_len, MUL_KARATSUBA_THRESHOLD, divrem!,
-    divrem_dc!, invert_pi1, DC_DIV_THRESHOLD
+    divrem_dc!, invert_pi1, DC_DIV_THRESHOLD,
+    invertappr!, invertappr_scratch_len, INV_NEWTON_THRESHOLD,
+    mu_divrem!
 using Random: MersenneTwister
 
 amem(v::Vector{UInt64}) = (m = Memory{UInt64}(undef, length(v)); copyto!(m, v); m)
@@ -384,6 +386,180 @@ end
 using NativeBigInt: barrett_setup, barrett_reduce!, powermod_limbs,
     BARRETT_THRESHOLD, BARRETT_EVEN_THRESHOLD
 
+@testset "invertappr!" begin
+    B = big(2)^64
+    # V = ⌊(β^2n - 1)/A⌋ - β^n; the -1 keeps V inside n limbs when A = β^n/2.
+    exactinv(A, n) = fld(B^(2n) - 1, A) - B^n
+    rng = MersenneTwister(20260822)
+    maxerr = big(0)
+
+    for n in vcat(1:64, 70:7:200, [255, 256, 257])
+        lo = B^n >> 1          # minimal normalized
+        hi = B^n - 1           # maximal
+        cands = BigInt[lo, hi, lo + 1, hi - 1, B^n - B^(n-1), lo | 1]
+        append!(cands, [rand(rng, lo:hi) for _ in 1:6])
+        for A in cands
+            @assert lo <= A <= hi          # contract: A normalized
+            d = afrombig(A, n)
+            V = exactinv(A, n)
+            # thr = 4 is the deepest recursion the clamp allows, thr = n forces
+            # the direct-division basecase; both must hold the contract at every
+            # size, independent of where INV_NEWTON_THRESHOLD sits.
+            for thr in (4, 5, n, INV_NEWTON_THRESHOLD)
+                ip = Memory{UInt64}(undef, n)
+                sc = Memory{UInt64}(undef, invertappr_scratch_len(n, thr))
+                invertappr!(ip, 0, d, 0, n, sc, 0, thr)
+                err = V - atoref(ip, 0, n)
+                @test 0 <= err <= 1
+                @test atoref(d, 0, n) == A     # d is read-only
+                maxerr = max(maxerr, err)
+            end
+            # the basecase divides exactly, so it should be error-free
+            ipb = Memory{UInt64}(undef, n)
+            invertappr!(ipb, 0, d, 0, n, nothing, 0, n)
+            @test atoref(ipb, 0, n) == V
+        end
+    end
+    @test maxerr <= 1
+
+    # n == 1 is exactly invert_limb: no error at all
+    for _ in 1:64
+        A = rand(rng, (B >> 1):(B - 1))
+        ip = Memory{UInt64}(undef, 1)
+        invertappr!(ip, 0, afrombig(A, 1), 0, 1)
+        @test atoref(ip, 0, 1) == exactinv(A, 1)
+    end
+
+    # invertappr_step!: refine a half-width seed instead of rebuilding from
+    # scratch. This is the entry point a caller carrying a reciprocal up a
+    # recursion uses, so it must hold the same ≤ 1 ulp contract on its own, and
+    # above the basecase threshold it must reproduce invertappr! exactly (same
+    # code path, just with the recursion supplied by the caller).
+    for n in (5, 6, 7, 16, 33, 64, 73, 100, 129, 200, 257)
+        A = rand(rng, (B^n >> 1):(B^n - 1))
+        d = afrombig(A, n)
+        hs = NativeBigInt.invertappr_seed_len(n)
+        l = n - hs
+        ip = Memory{UInt64}(undef, n)
+        invertappr!(ip, l, d, l, hs)          # seed: reciprocal of d's top hs limbs
+        # the step's own sizing — invertappr_scratch_len would give the
+        # basecase size for n <= thr and be too small
+        sc = Memory{UInt64}(undef, NativeBigInt.invertappr_step_scratch_len(n))
+        NativeBigInt.invertappr_step!(ip, 0, d, 0, n, sc, 0)
+        @test 0 <= exactinv(A, n) - atoref(ip, 0, n) <= 1
+        if n > INV_NEWTON_THRESHOLD
+            ref = Memory{UInt64}(undef, n)
+            invertappr!(ref, 0, d, 0, n)
+            @test atoref(ip, 0, n) == atoref(ref, 0, n)
+        end
+    end
+
+    # non-zero offsets and a caller-supplied scratch match the plain call
+    for n in (2, 3, 17, 64, 91)
+        A = rand(rng, (B^n >> 1):(B^n - 1))
+        d = afrombig(A, n)
+        ref = Memory{UInt64}(undef, n)
+        invertappr!(ref, 0, d, 0, n)
+
+        doff, ioff, soff = 5, 3, 7
+        dd = Memory{UInt64}(undef, n + doff)
+        fill!(dd, typemax(UInt64))
+        copyto!(dd, doff + 1, d, 1, n)
+        ii = Memory{UInt64}(undef, n + ioff)
+        fill!(ii, typemax(UInt64))
+        sc = Memory{UInt64}(undef, invertappr_scratch_len(n) + soff)
+        invertappr!(ii, ioff, dd, doff, n, sc, soff)
+        @test atoref(ii, ioff, n) == atoref(ref, 0, n)
+        @test atoref(dd, doff, n) == A
+    end
+end
+
+@testset "mu_divrem!" begin
+    rng = MersenneTwister(31337)
+    # (n, m) shapes: balanced 2m/m, long quotient, short quotient, ragged
+    shapes = Tuple{Int,Int}[]
+    for m in (2, 3, 5, 8, 17, 33, 64, 100, 129, 200)
+        push!(shapes, (2m, m), (2m + 1, m), (m + 1, m), (3m, m), (m + 2, m))
+        m >= 4 && push!(shapes, (5m, m), (2m - 1, m))
+    end
+    for (n, m) in shapes
+        n <= m && continue
+        for trial in 1:6
+            A = rand(rng, big(1):(big(2)^(64n) - 1))
+            # exercise both normalized and unnormalized divisors
+            D = trial <= 3 ? rand(rng, (big(2)^(64m - 1)):(big(2)^(64m) - 1)) :
+                             rand(rng, (big(2)^(64 * (m - 1))):(big(2)^(64m - 1) - 1))
+            D == 0 && continue
+            a = afrombig(A, n)
+            d = afrombig(D, m)
+            q = Memory{UInt64}(undef, n - m + 1)
+            r = Memory{UInt64}(undef, m)
+            mu_divrem!(q, 0, r, 0, a, 0, n, d, 0, m)
+            @test atoref(q, 0, n - m + 1) == fld(A, D)
+            @test atoref(r, 0, m) == mod(A, D)
+            @test atoref(a, 0, n) == A          # a is read-only
+            @test atoref(d, 0, m) == D
+        end
+    end
+
+    # agrees with divrem! limb for limb, including a caller-supplied scratch
+    for (n, m) in ((64, 32), (129, 64), (200, 100), (301, 100))
+        A = rand(rng, big(1):(big(2)^(64n) - 1))
+        D = rand(rng, (big(2)^(64m - 1)):(big(2)^(64m) - 1))
+        a = afrombig(A, n); d = afrombig(D, m)
+        q1 = Memory{UInt64}(undef, n - m + 1); r1 = Memory{UInt64}(undef, m)
+        q2 = Memory{UInt64}(undef, n - m + 1); r2 = Memory{UInt64}(undef, m)
+        divrem!(q1, 0, r1, 0, a, 0, n, d, 0, m)
+        sc = Memory{UInt64}(undef, NativeBigInt.mu_divrem_scratch_len(n, m) + 5)
+        mu_divrem!(q2, 0, r2, 0, a, 0, n, d, 0, m, sc, 5)
+        @test atoref(q1, 0, n - m + 1) == atoref(q2, 0, n - m + 1)
+        @test atoref(r1, 0, m) == atoref(r2, 0, m)
+    end
+
+    # divrem!'s Barrett dispatch: the predicate, and that routing through it
+    # still agrees with BigInt (nothing else in the suite reaches m >= 256)
+    @test NativeBigInt.mu_div_worthwhile(4 * 256 + 1, 256)
+    @test !NativeBigInt.mu_div_worthwhile(257, 256)      # k=1 at m=256: dc wins
+    @test !NativeBigInt.mu_div_worthwhile(2 * 256, 256)  # k=2 at m=256: dc wins
+    @test NativeBigInt.mu_div_worthwhile(2 * 384, 384)
+    @test NativeBigInt.mu_div_worthwhile(1025, 1024)
+    # short quotients below the qn crossover must never dispatch, at any m:
+    # mu degrades without limit as qn shrinks (100x at m=1024, qn=2 when this
+    # was unguarded), since the estimate cost does not shrink with it
+    for m in (256, 384, 1024, 4096, 16384), qn in (1, 2, 16, 64, 256, 512, 640)
+        qn < m && @test !NativeBigInt.mu_div_worthwhile(qn, m)
+    end
+    # ... but a long-enough quotient does dispatch even when shorter than the
+    # divisor: the deciding sub-problem is qn, not m
+    @test NativeBigInt.mu_div_worthwhile(768, 1024)
+    @test NativeBigInt.mu_div_worthwhile(2048, 4096)
+    @test !NativeBigInt.mu_div_worthwhile(512, 4096)
+    @test NativeBigInt.mu_div_worthwhile(4096, 4096)
+    for (n, m) in ((5 * 256, 256), (2 * 1024, 1024))
+        A = rand(rng, big(1):(big(2)^(64n) - 1))
+        D = rand(rng, (big(2)^(64m - 1)):(big(2)^(64m) - 1))
+        a = afrombig(A, n)
+        d = afrombig(D, m)
+        q = Memory{UInt64}(undef, n - m + 1)
+        r = Memory{UInt64}(undef, m)
+        divrem!(q, 0, r, 0, a, 0, n, d, 0, m)
+        @test atoref(q, 0, n - m + 1) == fld(A, D)
+        @test atoref(r, 0, m) == mod(A, D)
+    end
+
+    # adversarial divisors: minimal/maximal normalized, and a power of the base
+    for m in (4, 16, 64, 130), n in (2m, 3m + 1)
+        for D in (big(2)^(64m - 1), big(2)^(64m) - 1, big(2)^(64m) - big(2)^(64m - 1))
+            A = rand(rng, big(1):(big(2)^(64n) - 1))
+            a = afrombig(A, n); d = afrombig(D, m)
+            q = Memory{UInt64}(undef, n - m + 1); r = Memory{UInt64}(undef, m)
+            mu_divrem!(q, 0, r, 0, a, 0, n, d, 0, m)
+            @test atoref(q, 0, n - m + 1) == fld(A, D)
+            @test atoref(r, 0, m) == mod(A, D)
+        end
+    end
+end
+
 @testset "barrett_reduce!" begin
     rng = MersenneTwister(0xba44e77)
 
@@ -553,29 +729,83 @@ using NativeBigInt: HgcdMatrix, hgcd_matrix_cap, hgcd!, gcd!, gcdext!, normlen
     end
 end
 
-@testset "divappr! approximate quotient" begin
-    using NativeBigInt: divappr!, DIVAPPR_ERR
+@testset "divappr_dc!/divappr_bc! approximate quotient" begin
+    using NativeBigInt: divappr_dc!, divappr_bc!, invert_pi1, lshift!,
+        magnitude_bits, mu_divappr_core!, mu_divappr_scratch_len, invertappr!
     rng = MersenneTwister(0xd1ab)
     hib = UInt64(1) << 63
     β = big(1) << 64
 
+    # Driver for the divappr engines over arbitrary shapes: entry divisor
+    # truncation, normalization, then the dc/bc dispatch. Production has no
+    # such wrapper — sqrt.jl calls the engines directly from its own normalized
+    # buffer (sqrt.jl:238-248) — so the test supplies one rather than leaving
+    # the engines covered only indirectly through isqrt.
+    function divappr_ref!(q, qo, a, ao, n, d, do_, m; mu::Bool=false)
+        qn = n - m + 1
+        if m > qn + 2
+            drop = m - (qn + 2)
+            return divappr_ref!(q, qo, a, ao + drop, n - drop, d, do_ + drop,
+                                m - drop; mu = mu)
+        end
+        scratch = Memory{UInt64}(undef, n + 1 + 3m + mu_divappr_scratch_len(m))
+        if m <= 2 || magnitude_bits(a, ao, n) - magnitude_bits(d, do_, m) <= 2
+            return divrem!(q, qo, scratch, 0, a, ao, n, d, do_, m, scratch, m)
+        end
+        l = leading_zeros(d[do_+m])
+        nn = n + 1
+        if l == 0
+            copyto!(scratch, 1, a, ao + 1, n)
+            scratch[nn] = zero(UInt64)
+            dv, dvo = d, do_
+        else
+            scratch[nn] = lshift!(scratch, 0, a, ao, n, l)
+            lshift!(scratch, nn, d, do_, m, l)
+            dv, dvo = scratch, nn
+        end
+        if mu
+            # production always supplies the reciprocal (sqrt's ladder); build
+            # one here so the engine can be exercised over arbitrary shapes
+            invertappr!(scratch, nn + m, dv, dvo, m, scratch, nn + 2m)
+            mu_divappr_core!(q, qo, scratch, 0, nn, dv, dvo, m,
+                             scratch, nn + m, scratch, nn + 2m)
+            return nothing
+        end
+        v = invert_pi1(dv[dvo+m], dv[dvo+m-1])
+        if m >= DC_DIV_THRESHOLD && nn - m >= DC_DIV_THRESHOLD
+            divappr_dc!(q, qo, scratch, 0, nn, dv, dvo, m, v, DC_DIV_THRESHOLD,
+                        scratch, nn + m)
+        else
+            divappr_bc!(q, qo, scratch, 0, nn, dv, dvo, m, v)
+        end
+        return nothing
+    end
+
     # q̂ - floor(a/d): the contract is one-sided over-approximation by at most
-    # DIVAPPR_ERR ulps, with a unmodified and no remainder computed.
-    function apprerr(aref::BigInt, n, dref::BigInt, m)
+    # 32 ulps, with a unmodified and no remainder computed.
+    function apprerr(aref::BigInt, n, dref::BigInt, m; mu::Bool=false)
         a = afrombig(aref, n)
         acopy = copy(a)
         d = afrombig(dref, m)
         q = Memory{UInt64}(undef, n - m + 1)
-        divappr!(q, 0, a, 0, n, d, 0, m)
+        divappr_ref!(q, 0, a, 0, n, d, 0, m; mu = mu)
         @test a == acopy
         return atoref(q, 0, n - m + 1) - aref ÷ dref
     end
 
     maxerr = big(0)
+    maxmuerr = big(0)
     function checkshape(n, m, dref, aref)
         err = apprerr(aref, n, dref, m)
-        @test 0 <= err <= DIVAPPR_ERR
+        @test 0 <= err <= 32
         maxerr = max(maxerr, err)
+        # mu_divappr! over the same shapes: same one-sided contract, tighter
+        # bound (its only inexact block undershoots by <= 5, lifted by +5)
+        if m >= 3 && n > m
+            muerr = apprerr(aref, n, dref, m; mu = true)
+            @test 0 <= muerr <= 6
+            maxmuerr = max(maxmuerr, muerr)
+        end
     end
 
     # small random sweep: m = 1, 2, small-quotient path, unnormalized divisors
@@ -613,5 +843,6 @@ end
         qref * dref < β^n && checkshape(n, m, dref, qref * dref)
         checkshape(n, m, dref, β^n - 1)
     end
-    @test maxerr <= DIVAPPR_ERR
+    @test maxerr <= 32
+    @test maxmuerr <= 6
 end

@@ -18,30 +18,19 @@ function nbig_from_limbs(sgn::Int, limbs::Memory{Limb}, n::Int)
     return NBig(sgn * n, limbs)
 end
 
-# Build an NBig with the given sign from an unsigned magnitude `mag` supporting
-# `>>= 64` and `% Limb` (a Julia unsigned, or a nonnegative BigInt).
-function nbig_from_magnitude(sgn::Int, mag)
-    n = 0
-    v = mag
-    while v != 0
-        n += 1
-        v >>= 64
-    end
+function NBig(x::Base.BitInteger)
+    neg = signbit(x)
+    mag = neg ? -unsigned(x) : unsigned(x)
+    mag == 0 && return NBig(0, EMPTY_LIMBS)
+    n = cld(Base.top_set_bit(mag), 64)
     limbs = Memory{Limb}(undef, n)
-    v = mag
-    for i in 1:n
-        limbs[i] = v % Limb
-        v >>= 64
+    @inbounds for i in 1:n
+        limbs[i] = (mag >> (64 * (i - 1))) % Limb
     end
-    return NBig(sgn * n, limbs)
+    return NBig(neg ? -n : n, limbs)
 end
 
-function NBig(x::Integer)
-    x == 0 && return NBig(0, EMPTY_LIMBS)
-    sgn = x < 0 ? -1 : 1
-    return nbig_from_magnitude(sgn, unsigned(sgn < 0 ? -widen(x) : widen(x)))
-end
-NBig(x::Bool) = NBig(Int(x))
+NBig(x::Integer) = NBig(BigInt(x))
 NBig(x::NBig) = x
 
 # mpz_import/mpz_export with explicit 8-byte native-endian words are
