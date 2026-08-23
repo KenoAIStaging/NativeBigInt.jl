@@ -731,7 +731,8 @@ end
 
 @testset "divappr_dc!/divappr_bc! approximate quotient" begin
     using NativeBigInt: divappr_dc!, divappr_bc!, invert_pi1, lshift!,
-        magnitude_bits, mu_divappr_core!, mu_divappr_scratch_len, invertappr!
+        magnitude_bits, mu_divappr_core!, mu_div_step_scratch_len, invertappr!,
+        invertappr_scratch_len
     rng = MersenneTwister(0xd1ab)
     hib = UInt64(1) << 63
     β = big(1) << 64
@@ -748,7 +749,9 @@ end
             return divappr_ref!(q, qo, a, ao + drop, n - drop, d, do_ + drop,
                                 m - drop; mu = mu)
         end
-        scratch = Memory{UInt64}(undef, n + 1 + 3m + mu_divappr_scratch_len(m))
+        scratch = Memory{UInt64}(undef, n + 1 + 3m + m +
+                                        max(invertappr_scratch_len(m),
+                                            mu_div_step_scratch_len(m)))
         if m <= 2 || magnitude_bits(a, ao, n) - magnitude_bits(d, do_, m) <= 2
             return divrem!(q, qo, scratch, 0, a, ao, n, d, do_, m, scratch, m)
         end
@@ -799,7 +802,7 @@ end
         err = apprerr(aref, n, dref, m)
         @test 0 <= err <= 32
         maxerr = max(maxerr, err)
-        # mu_divappr! over the same shapes: same one-sided contract, tighter
+        # mu_divappr_core! over the same shapes: same one-sided contract, tighter
         # bound (its only inexact block undershoots by <= 5, lifted by +5)
         if m >= 3 && n > m
             muerr = apprerr(aref, n, dref, m; mu = true)

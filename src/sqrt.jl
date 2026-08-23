@@ -1,50 +1,18 @@
-# Karatsuba square root (Zimmermann, INRIA RR-3805): s[1..h] = isqrt(a[1..n]),
-# h = (n+1)>>1. Requires n even (or n <= 2) and a[ao+n] >= 2^62 (caller
-# normalizes by an even bit shift plus a zero low limb for odd lengths); an
-# odd-length high part would leave S' half-normalized, 2S' < β^hh, and the
-# quotient step unbounded.
-# On return a[ao+1..ao+h] holds the low limbs of the remainder a - s^2; the
-# return value is its top limb (0 or 1). scratch needs sqrt_scratch_len(h)
-# limbs at sco; recursion levels share it (a level touches it only after its
-# child returns).
-# With needrem = false only the root is guaranteed (a is still destroyed and
-# the return value is meaningless): above SQRT_DIVAPPR_THRESHOLD the top-level
-# division runs through the divappr engines (no remainder computed) and a guard-limb
-# certificate settles sign(R), R = A - S², outright — U is reconstructed with
-# one mul only in the ambiguous band (~2^-57 of inputs, plus perfect squares).
-# Below the threshold the exact division's remainder feeds cheap positivity
-# checks, and the final remainder phase — a quarter-size Q² square plus an
-# h-limb subtract — runs only when those can't fire. The recursion always
-# needs the child's remainder, so only the top level skips.
-# num + quotient slot + division scratch; the divisor is read from the root
-# buffer and the remainder/Q² overlay the division scratch, so ≈ 3.5h + 8.
-# The Barrett top-level path (mu_divappr!) wants more than the dc path in that
-# last region — a reciprocal plus its own working space — so the division
-# scratch takes whichever is larger.
-sqrt_scratch_len(h::Int) = sqrt_inv_base(h) + sqrt_inv_len(h)
-
-# Offset of the reciprocal ladder: everything the divisions need comes first,
-# and the ladder sits above it so it survives the parent overwriting its own
-# num/qq/dv regions (the recursion reuses those at the same sco).
-function sqrt_inv_base(h::Int)
-    lq = h >> 1
-    hh = h - lq
-    return (h + 2) + (lq + 3) +
-           max(h + 3 + 2hh, mu_divappr_scratch_len(hh),
-               invertappr_step_scratch_len(h), invertappr_scratch_len(h))
-end
-
-# The reciprocal ladder. Each level leaves inv(its root) — exactly the divisor
-# its parent divides by — in an h-limb slot, and the child's slot nests inside
-# it at ivo+lq, so the whole chain fits in the top level's h limbs.
+# Karatsuba square root (Zimmermann, INRIA RR-3805). Two entry points at the
+# bottom of this file: sqrtrem! (root and remainder) and sqrt! (root only).
 #
-#   level's slot:  iv[ivo+1 .. ivo+h]        = inv(S),        h limbs
-#   child's slot:  iv[ivo+lq+1 .. ivo+h]     = inv(S_child), hh limbs
-#
-# The child's slot is exactly where the parent's Newton step wants its seed, so
-# nothing is moved. Levels below MU_SQRT_MIN keep no reciprocal, and the
-# boundary level seeds the chain with a from-scratch invertappr!.
-sqrt_inv_len(h::Int) = h + 4
+# Order here is definition-before-use: tuning constants, then the scratch
+# layout, then the helpers, then the two entry points.
+
+# ---- tuning -----------------------------------------------------------------
+
+# Root-only top level switches from exact divrem! (whose remainder doubles as
+# the nonnegativity certificate) to divappr_dc! + guard-limb certificate once the
+# quotient is long enough for the skipped remainder work to beat the rare
+# fallback mul (bench/bench_sqrt_thr.jl: flat 4-48, gains from lq ≈ 16 up —
+# 4k bits — and no measurable win below; the division there is schoolbook,
+# where divappr_bc!'s triangle is the whole saving).
+const SQRT_DIVAPPR_THRESHOLD = 16
 
 # Two separate decisions; collapsing them into one constant costs time at both
 # ends, since they are gated by different things.
@@ -81,12 +49,46 @@ sqrt_inv_len(h::Int) = h + 4
 #   dc       100.8  117.7  179.0  171.5  387.5
 #   ladder    99.1  123.7  155.7  160.1  337.7
 #
-# so 896. There used to be a second tier between the two that bought its own
-# reciprocal for the top level (mu_divappr! + MU_DIVAPPR_THRESHOLD); it is gone,
-# because the band where it beat the ladder was one sample wide (it won at
-# hh = 768 and lost at 704, both inside ~2% run-to-run noise).
+# so 896. A middle tier that bought its own reciprocal for the top level was
+# tried and removed: the band where it beat the ladder was one sample wide (it
+# won at hh = 768, lost at 704, both inside ~2% run-to-run noise).
 const MU_SQRT_MIN = 192
 const MU_SQRT_LADDER = 896
+
+# ---- scratch layout ---------------------------------------------------------
+
+# The reciprocal ladder. Each level leaves inv(its root) — exactly the divisor
+# its parent divides by — in an h-limb slot, and the child's slot nests inside
+# it at ivo+lq, so the whole chain fits in the top level's h limbs.
+#
+#   level's slot:  iv[ivo+1 .. ivo+h]        = inv(S),        h limbs
+#   child's slot:  iv[ivo+lq+1 .. ivo+h]     = inv(S_child), hh limbs
+#
+# The child's slot is exactly where the parent's Newton step wants its seed, so
+# nothing is moved. Levels below MU_SQRT_MIN keep no reciprocal, and the
+# boundary level seeds the chain with a from-scratch invertappr!.
+sqrt_inv_len(h::Int) = h + 4
+
+# Offset of the reciprocal ladder: everything the divisions need comes first,
+# and the ladder sits above it so it survives the parent overwriting its own
+# num/qq/dv regions (the recursion reuses those at the same sco).
+#
+# The last region is shared by four users, whichever is largest: the dc path's
+# remainder/Q² overlay (the divisor is read from the root buffer, so it needs no
+# copy slot), the Barrett block scratch, and the two ways a level can build its
+# reciprocal — one ladder step, or the from-scratch base.
+function sqrt_inv_base(h::Int)
+    lq = h >> 1
+    hh = h - lq
+    return (h + 2) + (lq + 3) +
+           max(h + 3 + 2hh, mu_div_step_scratch_len(hh),
+               invertappr_step_scratch_len(h), invertappr_scratch_len(h))
+end
+
+# num + quotient slot + division scratch, then the reciprocal ladder.
+sqrt_scratch_len(h::Int) = sqrt_inv_base(h) + sqrt_inv_len(h)
+
+# ---- helpers ----------------------------------------------------------------
 
 # Build the level's division numerator at scratch[num+1..]: a ×β guard limb,
 # then N = (c1, R', A1) halved in place — (Q, U) = divrem(N, 2S') is run as
@@ -113,6 +115,172 @@ const MU_SQRT_LADDER = 896
     return numlen, ε
 end
 
+# Leave inv(S) — the reciprocal the parent divides by — in scratch[ivo+1..ivo+h].
+# The caller runs this after its correction loop, since that can decrement S.
+#
+# When the child kept a reciprocal it is already right-aligned at ivo+lq+1,
+# exactly where the doubling step wants its seed. At odd h the child's hh limbs
+# are already the guard width (lq+1) and one step finishes. At even h the step
+# wants one limb more than the child's root: that limb is the top of *this*
+# level's quotient, which did not exist until the division ran, so the widen
+# belongs here and not in the child. Both steps are guarded, so the ladder holds
+# ~1 ulp — seeding the doubling at exactly half instead compounds to 2.6e15 ulps
+# by 2048 limbs.
+function sqrt_build_inv!(s::Memory{Limb}, so::Int, h::Int, lq::Int, hh::Int,
+                         scratch::Memory{Limb}, ivo::Int, wso::Int, seeded::Bool)
+    if !seeded
+        # ladder base: below MU_SQRT_MIN no child keeps a reciprocal
+        return invertappr!(scratch, ivo, s, so, h, scratch, wso)
+    end
+    w = invertappr_seed_len(h)                      # = lq + 1
+    if hh < w
+        invertappr_step!(scratch, ivo + hh - 1, s, so + hh - 1, w, scratch, wso, hh)
+    end
+    invertappr_step!(scratch, ivo, s, so, h, scratch, wso, w)
+    return nothing
+end
+
+# a·2^δ ≥ b, exactly, for UInt128 mantissas with a signed binary exponent gap.
+@inline function ge_scaled(a::UInt128, b::UInt128, δ::Int)
+    if δ >= 0
+        δ >= 128 && return a != 0 || b == 0
+        mask = (UInt128(1) << δ) - 1
+        return a >= (b >> δ) + ((b & mask) != 0 ? UInt128(1) : UInt128(0))
+    end
+    sδ = -δ
+    sδ >= 128 && return b == 0
+    b > (typemax(UInt128) >> sδ) && return false
+    return a >= (b << sδ)
+end
+
+# Certificate for the divappr sqrt path: decide sign(R), R = U·β^lq + A0 - Q²,
+# without U. With Q exact and g the guard limb, floor(U·β/D) ∈ [g-E, g], so
+# U ∈ [(g-E)·D/β, (g+1)·D/β); D = 2S' and Q are bracketed by their top 64
+# bits (db·2^ed ≤ D < (db+1)·2^ed, likewise qb/eq) — S' is top-bit
+# normalized, so db is its top limb exactly and ed carries the doubling.
+# Returns 1 for R ≥ 0 certain (S is the root), -1 for R < 0 certain (root is
+# S-1: R > -β^2lq ≥ -(2S-1) since 2S ≥ β^hh·β^lq, so a single decrement
+# always lands), 0 for the ambiguous band around R = 0 (~2^-57 of inputs,
+# plus perfect squares).
+function sqrt_root_cert(s::Memory{Limb}, so::Int, lq::Int, hh::Int, g::Limb)
+    # The divappr engines over-approximate by ≤ ~20 ulps (derivation at
+    # divappr_dc_partial!). Kept loose at 32; sqrt_appr_top! rejects on the same
+    # value, so the two must agree.
+    E = Limb(32)
+    db = @inbounds s[so+lq+hh]
+    ed = 64 * (hh - 1) + 1
+    i = lq
+    @inbounds while i > 0 && s[so+i] == zero(Limb)
+        i -= 1
+    end
+    i == 0 && return 1                    # Q = 0: R = U·β^lq + A0 ≥ 0
+    q1 = @inbounds s[so+i]
+    lzq = leading_zeros(q1)
+    qb = lzq == 0 ? q1 :
+         (q1 << lzq) | (i > 1 ? (@inbounds(s[so+i-1]) >> (64 - lzq)) : zero(Limb))
+    eq = 64 * (i - 1) - lzq
+    eA = ed - 64 + 64lq
+    # R ≥ 0 ⟸ (g-E)·db·2^eA ≥ (qb+1)²·2^2eq > Q² (A0 ≥ 0 only helps)
+    B, eB = qb == typemax(Limb) ? (UInt128(1), 2eq + 128) :
+                                  (widemul(qb + one(Limb), qb + one(Limb)), 2eq)
+    ge_scaled(widemul(g - E, db), B, eA - eB) && return 1
+    # R < 0 ⟸ (g+1)·(db+1)·2^eA + β^lq ≤ qb²·2^2eq ≤ Q²; the A0 < β^lq slack
+    # folds into one LHS ulp since β^lq ≤ 2^eA (dl ≥ 3 here). The two typemax
+    # corners would overflow the mantissa product; punt them to the fallback.
+    if g != typemax(Limb) && db != typemax(Limb)
+        A2 = widemul(g + one(Limb), db + one(Limb))
+        ge_scaled(widemul(qb, qb), A2 + UInt128(1), 2eq - eA) && return -1
+    end
+    return 0
+end
+
+# Top-level root-only quotient via the divappr engines: N·β ÷ 2S' with one
+# guard limb ĝ, run as (N·β/2) ÷ S' on the pre-halved num buffer (guard limb
+# ε·2^63) so the divisor is the normalized root itself. Returns (code, rhi):
+# code 1 — certificate settled the root in s (possibly decremented); code 0 —
+# retry exactly (guard wrap ĝ < E leaves the integer part uncertain, or the
+# quotient overflowed β^lq; ~2^-59); code 2 — Q is exact and in s but
+# sign(R) is ambiguous: U = 2·(N₁ - Q·S') + ε has been reconstructed with
+# one hh×lq mul into a[ao+lq+1..] (top limb in rhi) and the caller finishes
+# with the shared exact remainder phase.
+function sqrt_appr_top!(s::Memory{Limb}, so::Int, a::Memory{Limb}, ao::Int,
+                        h::Int, lq::Int, hh::Int, ε::Limb, c1::Int,
+                        scratch::Memory{Limb}, num::Int, numlen::Int,
+                        qq::Int, dv::Int, ivo::Int, barrett::Bool)
+    nA = numlen + 1
+    @inbounds while nA > hh && scratch[num+nA] == zero(Limb)
+        nA -= 1
+    end
+    # N too short for a meaningful guard (needs R' = 0 and a zero A1 top —
+    # e.g. a perfect-square upper half): let the exact path handle it
+    @inbounds scratch[num+nA] == zero(Limb) && return 0, 0
+    fill!(view(scratch, qq+1:qq+lq+3), zero(Limb))
+    # run the divappr engines on the numerator buffer directly (it is
+    # disposable — the rare paths that still need N rebuild it from a); the
+    # appended zero top limb pins the carry-out to zero
+    nn = nA + 1
+    @inbounds scratch[num+nn] = zero(Limb)
+    if barrett
+        # the ladder already holds inv(S') at exactly this divisor's width, so
+        # the top level's Barrett quotient costs no reciprocal at all. Its ≤ 6
+        # ulp over-approximation is well inside the 32 the certificate allows.
+        mu_divappr_core!(scratch, qq, scratch, num, nn, s, so + lq, hh,
+                         scratch, ivo + lq, scratch, dv)
+    else
+        v = @inbounds invert_pi1(s[so+h], s[so+h-1])
+        if hh >= DC_DIV_THRESHOLD && nn - hh >= DC_DIV_THRESHOLD
+            divappr_dc!(scratch, qq, scratch, num, nn, s, so + lq, hh, v,
+                        DC_DIV_THRESHOLD, scratch, dv)
+        else
+            divappr_bc!(scratch, qq, scratch, num, nn, s, so + lq, hh, v)
+        end
+    end
+    qext = nA - hh + 1               # written limbs: guard, then integer part
+    @inbounds for i in qq+lq+2:qq+qext
+        scratch[i] != zero(Limb) && return 0, 0
+    end
+    g = @inbounds scratch[qq+1]
+    g < Limb(32) && return 0, 0      # divappr error bound, per sqrt_root_cert
+    copyto!(s, so + 1, scratch, qq + 2, lq)
+    verdict = sqrt_root_cert(s, so, lq, hh, g)
+    if verdict != 0
+        verdict < 0 && sub_1!(s, so, s, so, h, one(Limb))
+        return 1, 0
+    end
+    numlen, ε = sqrt_build_num!(scratch, num, a, ao, lq, h, hh, c1)
+    mul!(scratch, dv, s, so + lq, hh, scratch, qq + 1, lq)   # Q·S' ≤ N₁
+    plen = hh + lq
+    @inbounds while plen > numlen && scratch[dv+plen] == zero(Limb)
+        plen -= 1
+    end
+    sub!(scratch, num + 1, scratch, num + 1, numlen, scratch, dv, plen)
+    uc = lshift!(a, ao + lq, scratch, num + 1, hh, 1)        # U = 2U₁ + ε
+    @inbounds a[ao+lq+1] |= ε
+    return 2, Int(uc)
+end
+
+# ---- entry points -----------------------------------------------------------
+
+# s[1..h] = isqrt(a[1..n]), h = (n+1)>>1. Requires n even (or n <= 2) and
+# a[ao+n] >= 2^62 (caller normalizes by an even bit shift plus a zero low limb
+# for odd lengths); an odd-length high part would leave S' half-normalized,
+# 2S' < β^hh, and the quotient step unbounded.
+#
+# On return a[ao+1..ao+h] holds the low limbs of the remainder a - s^2; the
+# return value is its top limb (0 or 1). scratch needs sqrt_scratch_len(h)
+# limbs at sco; recursion levels share it (a level touches it only after its
+# child returns).
+#
+# With needrem = false only the root is guaranteed (a is still destroyed and
+# the return value is meaningless): above SQRT_DIVAPPR_THRESHOLD the top-level
+# division runs through the divappr engines (no remainder computed) and a
+# guard-limb certificate settles sign(R), R = A - S², outright — U is
+# reconstructed with one mul only in the ambiguous band (~2^-57 of inputs, plus
+# perfect squares). Below the threshold the exact division's remainder feeds
+# cheap positivity checks, and the final remainder phase — a quarter-size Q²
+# square plus an h-limb subtract — runs only when those can't fire. The
+# recursion always needs the child's remainder, so only the top level skips.
+#
 # ivo is the base of this level's reciprocal slot (see sqrt_inv_len); wantinv
 # says whether the caller will divide by this level's root with Barrett and so
 # needs inv(S) left there. ivo < 0 means no ladder at all.
@@ -231,31 +399,6 @@ function sqrtrem!(s::Memory{Limb}, so::Int, a::Memory{Limb}, ao::Int, n::Int,
     return rhi
 end
 
-# Leave inv(S) — the reciprocal the parent divides by — in scratch[ivo+1..ivo+h].
-# Runs after the correction loop above, since that can decrement S.
-#
-# When the child kept a reciprocal it is already right-aligned at ivo+lq+1,
-# exactly where the doubling step wants its seed. At odd h the child's hh limbs
-# are already the guard width (lq+1) and one step finishes. At even h the step
-# wants one limb more than the child's root: that limb is the top of *this*
-# level's quotient, which did not exist until the division above ran, so the
-# widen belongs here and not in the child. Both steps are guarded, so the
-# ladder holds ~1 ulp — seeding the doubling at exactly half instead compounds
-# to 2.6e15 ulps by 2048 limbs.
-function sqrt_build_inv!(s::Memory{Limb}, so::Int, h::Int, lq::Int, hh::Int,
-                         scratch::Memory{Limb}, ivo::Int, wso::Int, seeded::Bool)
-    if !seeded
-        # ladder base: below MU_SQRT_THRESHOLD no child keeps a reciprocal
-        return invertappr!(scratch, ivo, s, so, h, scratch, wso)
-    end
-    w = invertappr_seed_len(h)                      # = lq + 1
-    if hh < w
-        invertappr_step!(scratch, ivo + hh - 1, s, so + hh - 1, w, scratch, wso, hh)
-    end
-    invertappr_step!(scratch, ivo, s, so, h, scratch, wso, w)
-    return nothing
-end
-
 # Root-only square root: sqrtrem! with the top-level remainder phase elided;
 # same contract, but a's contents on return are unspecified.
 function sqrt!(s::Memory{Limb}, so::Int, a::Memory{Limb}, ao::Int, n::Int,
@@ -266,136 +409,4 @@ function sqrt!(s::Memory{Limb}, so::Int, a::Memory{Limb}, ao::Int, n::Int,
     ivo = h - (h >> 1) >= MU_SQRT_LADDER ? sco + sqrt_inv_base(h) : -1
     sqrtrem!(s, so, a, ao, n, scratch, sco, false, ivo, false)
     return nothing
-end
-
-# Root-only top level switches from exact divrem! (whose remainder doubles as
-# the nonnegativity certificate) to divappr_dc! + guard-limb certificate once the
-# quotient is long enough for the skipped remainder work to beat the rare
-# fallback mul (bench/bench_sqrt_thr.jl: flat 4-48, gains from lq ≈ 16 up —
-# 4k bits — and no measurable win below; the division there is schoolbook,
-# where divappr_bc!'s triangle is the whole saving).
-const SQRT_DIVAPPR_THRESHOLD = 16
-
-# a·2^δ ≥ b, exactly, for UInt128 mantissas with a signed binary exponent gap.
-@inline function ge_scaled(a::UInt128, b::UInt128, δ::Int)
-    if δ >= 0
-        δ >= 128 && return a != 0 || b == 0
-        mask = (UInt128(1) << δ) - 1
-        return a >= (b >> δ) + ((b & mask) != 0 ? UInt128(1) : UInt128(0))
-    end
-    sδ = -δ
-    sδ >= 128 && return b == 0
-    b > (typemax(UInt128) >> sδ) && return false
-    return a >= (b << sδ)
-end
-
-# Certificate for the divappr sqrt path: decide sign(R), R = U·β^lq + A0 - Q²,
-# without U. With Q exact and g the guard limb, floor(U·β/D) ∈ [g-E, g], so
-# U ∈ [(g-E)·D/β, (g+1)·D/β); D = 2S' and Q are bracketed by their top 64
-# bits (db·2^ed ≤ D < (db+1)·2^ed, likewise qb/eq) — S' is top-bit
-# normalized, so db is its top limb exactly and ed carries the doubling.
-# Returns 1 for R ≥ 0 certain (S is the root), -1 for R < 0 certain (root is
-# S-1: R > -β^2lq ≥ -(2S-1) since 2S ≥ β^hh·β^lq, so a single decrement
-# always lands), 0 for the ambiguous band around R = 0 (~2^-57 of inputs,
-# plus perfect squares).
-function sqrt_root_cert(s::Memory{Limb}, so::Int, lq::Int, hh::Int, g::Limb)
-    # One-sided bound on the divappr engines' quotient over-approximation, in
-    # ulps: entry/per-level divisor truncation contributes ≤ 1 each (numerator
-    # ≤ β^qn·d against a kept top ≥ β^(t-1), t = qn+2), the triangle basecase
-    # ≤ 2, and the dc recursion halves the block per level — ≤ ~20 for any
-    # feasible size. Kept loose at 32; sqrt_appr_top! below rejects on the same
-    # value, so the two must agree.
-    E = Limb(32)
-    db = @inbounds s[so+lq+hh]
-    ed = 64 * (hh - 1) + 1
-    i = lq
-    @inbounds while i > 0 && s[so+i] == zero(Limb)
-        i -= 1
-    end
-    i == 0 && return 1                    # Q = 0: R = U·β^lq + A0 ≥ 0
-    q1 = @inbounds s[so+i]
-    lzq = leading_zeros(q1)
-    qb = lzq == 0 ? q1 :
-         (q1 << lzq) | (i > 1 ? (@inbounds(s[so+i-1]) >> (64 - lzq)) : zero(Limb))
-    eq = 64 * (i - 1) - lzq
-    eA = ed - 64 + 64lq
-    # R ≥ 0 ⟸ (g-E)·db·2^eA ≥ (qb+1)²·2^2eq > Q² (A0 ≥ 0 only helps)
-    B, eB = qb == typemax(Limb) ? (UInt128(1), 2eq + 128) :
-                                  (widemul(qb + one(Limb), qb + one(Limb)), 2eq)
-    ge_scaled(widemul(g - E, db), B, eA - eB) && return 1
-    # R < 0 ⟸ (g+1)·(db+1)·2^eA + β^lq ≤ qb²·2^2eq ≤ Q²; the A0 < β^lq slack
-    # folds into one LHS ulp since β^lq ≤ 2^eA (dl ≥ 3 here). The two typemax
-    # corners would overflow the mantissa product; punt them to the fallback.
-    if g != typemax(Limb) && db != typemax(Limb)
-        A2 = widemul(g + one(Limb), db + one(Limb))
-        ge_scaled(widemul(qb, qb), A2 + UInt128(1), 2eq - eA) && return -1
-    end
-    return 0
-end
-
-# Top-level root-only quotient via the divappr engines (spec §3): N·β ÷ 2S' with one
-# guard limb ĝ, run as (N·β/2) ÷ S' on the pre-halved num buffer (guard limb
-# ε·2^63) so the divisor is the normalized root itself. Returns (code, rhi):
-# code 1 — certificate settled the root in s (possibly decremented); code 0 —
-# retry exactly (guard wrap ĝ < E leaves the integer part uncertain, or the
-# quotient overflowed β^lq; ~2^-59); code 2 — Q is exact and in s but
-# sign(R) is ambiguous: U = 2·(N₁ - Q·S') + ε has been reconstructed with
-# one hh×lq mul into a[ao+lq+1..] (top limb in rhi) and the caller finishes
-# with the shared exact remainder phase.
-function sqrt_appr_top!(s::Memory{Limb}, so::Int, a::Memory{Limb}, ao::Int,
-                        h::Int, lq::Int, hh::Int, ε::Limb, c1::Int,
-                        scratch::Memory{Limb}, num::Int, numlen::Int,
-                        qq::Int, dv::Int, ivo::Int, barrett::Bool)
-    nA = numlen + 1
-    @inbounds while nA > hh && scratch[num+nA] == zero(Limb)
-        nA -= 1
-    end
-    # N too short for a meaningful guard (needs R' = 0 and a zero A1 top —
-    # e.g. a perfect-square upper half): let the exact path handle it
-    @inbounds scratch[num+nA] == zero(Limb) && return 0, 0
-    fill!(view(scratch, qq+1:qq+lq+3), zero(Limb))
-    # run the divappr engines on the numerator buffer directly (it is
-    # disposable — the rare paths that still need N rebuild it from a); the
-    # appended zero top limb pins the carry-out to zero
-    nn = nA + 1
-    @inbounds scratch[num+nn] = zero(Limb)
-    # The shape here is balanced (qn ≈ hh), so the Barrett tier is gated on the
-    # divisor size alone. Its ≤ 6 ulp over-approximation is well inside the 32
-    # the certificate below allows, so nothing downstream changes.
-    if barrett
-        # the ladder already holds inv(S') at exactly this divisor's width, so
-        # the top level's Barrett quotient costs no reciprocal at all
-        mu_divappr_core!(scratch, qq, scratch, num, nn, s, so + lq, hh,
-                         scratch, ivo + lq, scratch, dv)
-    else
-        v = @inbounds invert_pi1(s[so+h], s[so+h-1])
-        if hh >= DC_DIV_THRESHOLD && nn - hh >= DC_DIV_THRESHOLD
-            divappr_dc!(scratch, qq, scratch, num, nn, s, so + lq, hh, v,
-                        DC_DIV_THRESHOLD, scratch, dv)
-        else
-            divappr_bc!(scratch, qq, scratch, num, nn, s, so + lq, hh, v)
-        end
-    end
-    qext = nA - hh + 1               # written limbs: guard, then integer part
-    @inbounds for i in qq+lq+2:qq+qext
-        scratch[i] != zero(Limb) && return 0, 0
-    end
-    g = @inbounds scratch[qq+1]
-    g < Limb(32) && return 0, 0      # divappr error bound, per sqrt_root_cert
-    copyto!(s, so + 1, scratch, qq + 2, lq)
-    verdict = sqrt_root_cert(s, so, lq, hh, g)
-    if verdict != 0
-        verdict < 0 && sub_1!(s, so, s, so, h, one(Limb))
-        return 1, 0
-    end
-    numlen, ε = sqrt_build_num!(scratch, num, a, ao, lq, h, hh, c1)
-    mul!(scratch, dv, s, so + lq, hh, scratch, qq + 1, lq)   # Q·S' ≤ N₁
-    plen = hh + lq
-    @inbounds while plen > numlen && scratch[dv+plen] == zero(Limb)
-        plen -= 1
-    end
-    sub!(scratch, num + 1, scratch, num + 1, numlen, scratch, dv, plen)
-    uc = lshift!(a, ao + lq, scratch, num + 1, hh, 1)        # U = 2U₁ + ε
-    @inbounds a[ao+lq+1] |= ε
-    return 2, Int(uc)
 end

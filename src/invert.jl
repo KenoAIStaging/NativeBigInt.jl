@@ -372,11 +372,6 @@ function mu_divrem_core!(q::Memory{Limb}, qo::Int, u::Memory{Limb}, uo::Int, nn:
     return nothing
 end
 
-# Scratch limbs mu_divappr! needs at so: the m-limb reciprocal, then whichever
-# of invertappr!'s own scratch and the step scratch is larger (used in sequence).
-mu_divappr_scratch_len(m::Int) =
-    m + max(invertappr_scratch_len(m), mu_div_step_scratch_len(m))
-
 # Barrett approximate quotient, with divappr_dc!'s contract: u (nn limbs,
 # destroyed, holds no remainder afterwards) ÷ normalized m-limb d, writing
 # qn = nn-m limbs to q with
@@ -393,14 +388,13 @@ mu_divappr_scratch_len(m::Int) =
 #
 # The estimate undershoots by at most 5, so adding 5 turns it into the
 # one-sided *over*-approximation divappr's callers require (sqrt.jl's guard-limb
-# certificate depends on the sign). The reciprocal is always the full m limbs
-# here: divappr's entry truncation already puts qn within 2 of m, so
-# mu_inv_size would return m anyway, and ii == m keeps the estimate free of the
-# truncated-divisor overshoot that would complicate the bound.
-# The reciprocal is supplied, never built here: sqrt's ladder already holds inv
-# of exactly this divisor (the child's root), so the top level pays nothing for
-# it. A wrapper that built its own existed and lost to the ladder everywhere the
-# two overlapped, so it is gone.
+# certificate depends on the sign).
+#
+# iv is the full m limbs and is supplied, never built here: sqrt's ladder
+# already holds inv of exactly this divisor (the child's root), so its only
+# caller pays nothing for it. Using the full width also keeps the estimate free
+# of the truncated-divisor overshoot that would complicate the bound above.
+# scratch needs mu_div_step_scratch_len(m) limbs at wso.
 function mu_divappr_core!(q::Memory{Limb}, qo::Int, u::Memory{Limb}, uo::Int, nn::Int,
                           d::Memory{Limb}, do_::Int, m::Int,
                           iv::Memory{Limb}, ivo::Int,

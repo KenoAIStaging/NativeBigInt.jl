@@ -214,15 +214,22 @@ function divrem_dc!(q::Memory{Limb}, qo::Int, u::Memory{Limb}, uo::Int, nn::Int,
 end
 
 # Approximate leading quotient block, no remainder: writes s quotient limbs q̂
-# for the top m+s live limbs of u by the m-limb normalized d, with
-# q_true ≤ q̂ ≤ q_true + E (E ≤ ~20, bounded in sqrt_root_cert); u above uo is destroyed and
-# holds nothing meaningful. Returns the extra top quotient bit/carry (the
-# over-approximation of a maximal true quotient can carry out; callers fold
-# it). Structure: truncate the divisor to its top s+2 limbs (only they can
-# move the quotient by > 1 ulp — Lemma 1 in the divappr spec), peel the top
-# ⌈s/2⌉ quotient limbs exactly with divrem_dc_partial! (their remainder feeds
-# the rest; approximating them would scale the error by β^s2), and recurse on
-# the bottom half — the recursion is where the remainder work is saved.
+# for the top m+s live limbs of u by the m-limb normalized d, one-sided with
+# q_true ≤ q̂ ≤ q_true + E; u above uo is destroyed and holds nothing
+# meaningful. Returns the extra top quotient bit/carry (the over-approximation
+# of a maximal true quotient can carry out; callers fold it).
+#
+# E ≤ ~20 for any feasible size: entry and per-level divisor truncation
+# contribute ≤ 1 each (numerator ≤ β^qn·d against a kept top ≥ β^(t-1),
+# t = qn+2), the triangle basecase ≤ 2, and the dc recursion halves the block
+# per level. sqrt_root_cert allows 32, so it has slack.
+#
+# Structure: truncate the divisor to its top s+2 limbs — only those can move
+# the quotient by more than 1 ulp, since the dropped tail is < β^(m-s-2) against
+# a divisor ≥ β^(m-1) — then peel the top ⌈s/2⌉ quotient limbs exactly with
+# divrem_dc_partial! (their remainder feeds the rest; approximating them would
+# scale the error by β^s2), and recurse on the bottom half — the recursion is
+# where the remainder work is saved.
 function divappr_dc_partial!(q::Memory{Limb}, qo::Int, u::Memory{Limb}, uo::Int,
                              d::Memory{Limb}, do_::Int, m::Int, s::Int, v::Limb,
                              scratch::Memory{Limb}, so::Int, thr::Int)
@@ -267,18 +274,8 @@ function divappr_dc!(q::Memory{Limb}, qo::Int, u::Memory{Limb}, uo::Int, nn::Int
     return qh
 end
 
-# There is no divrem!-style wrapper around the divappr engines: the only
-# consumer is sqrt.jl, which drives divappr_dc!/divappr_bc! directly from its
-# own normalized numerator buffer (sqrt.jl:238-248). A wrapper existed and was
-# never called from anywhere but its test; test_algorithms.jl now carries an
-# equivalent driver so the engines keep their direct coverage over arbitrary
-# shapes. Two things that wrapper knew, worth keeping written down:
-#
-#   * Entry divisor truncation: with qn = n-m+1, only the top qn+2 divisor
-#     limbs can move the quotient by more than 1 ulp, so for m > qn+2 the rest
-#     can be dropped along with the matching low numerator limbs. That is what
-#     keeps divappr out of the short-quotient regime entirely (after the
-#     truncation qn >= m-2 always) — relevant if a Barrett tier is ever added
-#     here, since it would inherit a reciprocal of size min(m, qn+2).
-#   * The appended-zero normalization limb keeps even the over-approximated
-#     quotient inside n-m+1 limbs (q < 2β^(qn-1) ≪ β^qn), so no carry escapes.
+# These engines have no divrem!-style entry wrapper: their only consumer is
+# sqrt.jl, which drives them directly off its own normalized numerator buffer,
+# supplying the appended zero limb that keeps the over-approximated quotient
+# inside nn-m limbs. test_algorithms.jl carries an equivalent driver so they
+# keep direct coverage over arbitrary shapes.
