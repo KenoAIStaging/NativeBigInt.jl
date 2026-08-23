@@ -19,9 +19,9 @@
 # pocket. Before E was windowed in the assembly step this sat at 232.
 const INV_NEWTON_THRESHOLD = 72
 
-# Scratch limbs the basecase needs at sco: the 2n-limb numerator it divides in
-# place, then divrem_dc!'s n-limb block scratch.
-invertappr_bc_scratch_len(n::Int) = n <= 1 ? 0 : 3n
+# Scratch limbs the basecase needs at sco: just the 2n-limb numerator it
+# divides in place.
+invertappr_bc_scratch_len(n::Int) = n <= 1 ? 0 : 2n
 
 # Scratch limbs invertappr! needs at sco. The recursive call completes before
 # either working region is touched, so every level shares one buffer: S (the
@@ -40,13 +40,18 @@ end
 # all. Exact division rather than the divappr engines, whose ~20 ulps would swamp
 # the ≤ 1 contract.
 #
-# Goes straight to divrem_bc!/divrem_dc! rather than through divrem!. d is
-# already normalized by contract, so divrem! would only add work we can skip:
-# it copies the numerator into its own scratch (we generate ours in place, and
-# these kernels destroy it anyway), and it materializes an n-limb remainder we
-# discard. The quotient is in [β^n, 2β^n - 1], so the n limbs these write are
-# exactly X and the returned qh is the (discarded) leading 1 — no n+1-limb
-# quotient buffer and no copy out.
+# Goes straight to divrem_bc! rather than through divrem!. d is already
+# normalized by contract, so divrem! would only add work we can skip: it copies
+# the numerator into its own scratch (we generate ours in place, and the kernel
+# destroys it anyway), and it materializes an n-limb remainder we discard. The
+# quotient is in [β^n, 2β^n - 1], so the n limbs it writes are exactly X and the
+# returned qh is the (discarded) leading 1 — no n+1-limb quotient buffer and no
+# copy out.
+#
+# Schoolbook is the only arm needed: invertappr! enters here only at
+# n <= INV_NEWTON_THRESHOLD (72), below DC_DIV_THRESHOLD (100), so a dc arm was
+# unreachable outside tests that force thr = n. Keeping it would tie invert.jl
+# to the dc engines for no production benefit.
 function invertappr_bc!(ip::Memory{Limb}, io::Int, d::Memory{Limb}, do_::Int, n::Int,
                         scratch::Memory{Limb}, sco::Int)
     if n == 1
@@ -57,12 +62,7 @@ function invertappr_bc!(ip::Memory{Limb}, io::Int, d::Memory{Limb}, do_::Int, n:
         scratch[sco+i] = typemax(Limb)          # numerator β^2n - 1, destroyed
     end
     v = @inbounds invert_pi1(d[do_+n], d[do_+n-1])
-    if n >= DC_DIV_THRESHOLD
-        divrem_dc!(ip, io, scratch, sco, 2n, d, do_, n, v, DC_DIV_THRESHOLD,
-                   scratch, sco + 2n)
-    else
-        divrem_bc!(ip, io, scratch, sco, 2n, d, do_, n, v)
-    end
+    divrem_bc!(ip, io, scratch, sco, 2n, d, do_, n, v)
     return nothing
 end
 

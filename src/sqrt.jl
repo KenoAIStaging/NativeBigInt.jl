@@ -228,7 +228,9 @@ function sqrt_appr_top!(s::Memory{Limb}, so::Int, a::Memory{Limb}, ao::Int,
                          scratch, ivo + lq, scratch, dv)
     else
         v = @inbounds invert_pi1(s[so+h], s[so+h-1])
-        if hh >= DC_DIV_THRESHOLD && nn - hh >= DC_DIV_THRESHOLD
+        if hh >= DIVAPPR_DC_THRESHOLD && nn - hh >= DIVAPPR_DC_THRESHOLD
+            # thr stays DC_DIV_THRESHOLD: inside the recursion it cuts off the
+            # *exact* sub-blocks, whose crossover is the lower one.
             divappr_dc!(scratch, qq, scratch, num, nn, s, so + lq, hh, v,
                         DC_DIV_THRESHOLD, scratch, dv)
         else

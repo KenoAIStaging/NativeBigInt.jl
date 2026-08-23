@@ -213,6 +213,31 @@ function divrem_dc!(q::Memory{Limb}, qo::Int, u::Memory{Limb}, uo::Int, nn::Int,
     return qh
 end
 
+# Schoolbook → divide-and-conquer crossover for the *approximate* engines. It is
+# far higher than DC_DIV_THRESHOLD because divappr_bc! truncates every row's
+# submul to the triangle (kernels/div.jl:345), a constant-factor saving that
+# divappr_dc! largely forfeits — all its blocks above the bottom-most run the
+# exact divrem_dc_partial!, remainder work included.
+#
+# divappr_bc!/divappr_dc! on balanced nn = 2m+1, by divisor limbs m:
+#
+#   m      100   128   192   256   384   512   640   768   896
+#   ratio  0.87  0.81  0.90  0.91  1.02  1.09  1.31  1.47  1.50
+#
+# Set from a paired isqrt A/B (identical seeded inputs, this constant the only
+# variable), by the top-level divisor width hh it reaches. hh = 64 and hh = 448
+# take the same engine either way and serve as controls, putting the noise floor
+# at 0.4%:
+#
+#   hh        64*   128    192    256    352    448*
+#   thr=100  2.72  7.47   13.40  24.22  38.02  51.79   us
+#   thr=384  2.71  6.75   12.81  22.34  38.80  51.63
+#
+# So schoolbook is worth 4.6-10.7% through hh = 256 but loses 2% by hh = 352 --
+# 320 takes the wins and leaves 352 on the recursion. Sharing DC_DIV_THRESHOLD
+# here (as sqrt did before this constant existed) gave up that whole band.
+const DIVAPPR_DC_THRESHOLD = 320
+
 # Approximate leading quotient block, no remainder: writes s quotient limbs q̂
 # for the top m+s live limbs of u by the m-limb normalized d, one-sided with
 # q_true ≤ q̂ ≤ q_true + E; u above uo is destroyed and holds nothing
