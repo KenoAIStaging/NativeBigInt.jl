@@ -421,8 +421,9 @@ mu_divrem!(q::Memory{Limb}, qo::Int, r::Memory{Limb}, ro::Int,
 const BARRETT_THRESHOLD = 96
 const BARRETT_EVEN_THRESHOLD = 160
 
-# Per-modulus reduction state. Concrete fields (never a Union) so the caller's
-# hot loop stays type-stable; the unused case is an EMPTY_LIMBS dummy.
+# Per-modulus reduction state (powermod_limbs holds `nothing` instead when the
+# Barrett tier isn't taken — the union-split check per reduction is nothing
+# next to the two k-limb products).
 struct MuReduce
     l::Int                  # normalizing shift of m
     mp::Memory{Limb}        # m << l: k limbs, top bit set
@@ -431,10 +432,6 @@ struct MuReduce
     u::Memory{Limb}         # shifted numerator, 2k limbs, destroyed per call
     scratch::Memory{Limb}   # div_block! working space
 end
-
-mu_reduce_empty() =
-    MuReduce(0, EMPTY_LIMBS, MuEngine(EMPTY_LIMBS, 0, 0), EMPTY_LIMBS,
-             EMPTY_LIMBS, EMPTY_LIMBS)
 
 # Once-per-modulus setup for the k-limb m (m[k] ≠ 0, k ≥ 2). Normalizing here
 # rather than per reduction is what lets invertappr! be called once: its Newton

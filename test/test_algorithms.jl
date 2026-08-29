@@ -646,8 +646,8 @@ using NativeBigInt: HgcdMatrix, hgcd_matrix_cap, hgcd!, gcd!, gcdext!, normlen
     end
 end
 
-@testset "div_blocks! (approx)/divappr_bc! approximate quotient" begin
-    using NativeBigInt: divappr_bc!, invert_pi1, lshift!,
+@testset "div_blocks! (approx)/divrem_bc! approx quotient" begin
+    using NativeBigInt: divrem_bc!, invert_pi1, lshift!,
         magnitude_bits, mu_block_scratch_len, invertappr!,
         invertappr_scratch_len
     rng = MersenneTwister(0xd1ab)
@@ -696,7 +696,7 @@ end
             div_blocks!(q, qo, scratch, 0, nn, dv, dvo, m,
                         DcEngine(v), true, scratch, nn + m)
         else
-            divappr_bc!(q, qo, scratch, 0, nn, dv, dvo, m, v)
+            divrem_bc!(q, qo, scratch, 0, nn, dv, dvo, m, v, true)
         end
         return nothing
     end

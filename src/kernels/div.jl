@@ -250,7 +250,7 @@ end
 # precondition but forces qhat = β-1 exactly, and the window bound W < β·d rules
 # out a borrow past the top limb. Refresh the stale top slot, one scalar submul,
 # then return the re-paired window ⟨n1,n0⟩. Rare (cold) path. s low divisor
-# limbs are skipped (0 for the exact basecase; divappr_bc!'s row truncation).
+# limbs are skipped (0 in exact mode; approx mode's row truncation).
 @inline function divrem_bc_degrow!(u::Memory{Limb}, uo::Int, j::Int,
                                    d::Memory{Limb}, do_::Int, m::Int, n0::Limb,
                                    s::Int)
@@ -261,8 +261,9 @@ end
 
 # Schoolbook (Knuth Algorithm D) quotient/remainder, two quotient limbs per
 # pass (radix β²). u (nn limbs) is destroyed: the m-limb remainder is left in
-# u[1..m]. d must be normalized (top bit of d[m] set), m ≥ 2, v = invert_pi1 of
-# its top two limbs. Writes q[1..nn-m]; returns the extra top quotient bit qh.
+# u[1..m] (meaningless in approx mode). d must be normalized (top bit of d[m]
+# set), m ≥ 2, v = invert_pi1 of its top two limbs. Writes q[1..nn-m]; returns
+# the extra top quotient bit qh.
 #
 # Each super-row: a 4/2 division of the top window (two chained div_3by2)
 # yields the exact quotient ⟨qhi,qlo⟩ of the top four limbs by ⟨d1,d0⟩ — a
@@ -270,8 +271,20 @@ end
 # (TAOCP 4.3.1 Thm A/B) — then one submul_2! sweep subtracts both rows at
 # once, halving the passes over u versus limb-at-a-time. The top two window
 # limbs ⟨n1, n0⟩ live in registers across rows (their memory slots are stale).
+#
+# approx mode skips each row's s lowest divisor limbs — the triangle instead
+# of the square, ~qn²/2 submul work in the balanced case, keeping the top
+# (row + 2) of d[1..m-2] — making the quotient a one-sided over-approximation:
+# q_true ≤ q̂ ≤ q_true + 2. Soundness: row j's neglected products are confined
+# to positions ≤ m-4-G (G = 2 guard limbs, constant across rows since the kept
+# length shrinks with j) and total less than qn·β^(m-2-G)/2 ≤ D·β^(-G)/2,
+# while every window read sits at positions ≥ m-2 — so the run is exact
+# schoolbook on a numerator perturbed upward by Δ < D, and each row's divisor
+# is a truncation of d (only ever smaller): the quotient never undershoots and
+# overshoots by at most ⌈Δ/D⌉ + 1 ≤ 2. Add-backs must restore exactly the
+# truncated window that was subtracted. The exact mode is s ≡ 0.
 function divrem_bc!(q::Memory{Limb}, qo::Int, u::Memory{Limb}, uo::Int, nn::Int,
-                    d::Memory{Limb}, do_::Int, m::Int, v::Limb)
+                    d::Memory{Limb}, do_::Int, m::Int, v::Limb, approx::Bool=false)
     qn = nn - m
     qh = zero(Limb)
     if cmp_limbs(u, uo+qn, m, d, do_, m) >= 0
@@ -285,92 +298,7 @@ function divrem_bc!(q::Memory{Limb}, qo::Int, u::Memory{Limb}, uo::Int, nn::Int,
     n0 = @inbounds u[uo+nn-1]
     j = qn
     @inbounds while j >= 2
-        if n1 == d1 && n0 == d0
-            n1, n0 = divrem_bc_degrow!(u, uo, j, d, do_, m, n0, 0)
-            q[qo+j] = typemax(Limb)
-            j -= 1
-            continue
-        end
-        qhi, t1, t0 = div_3by2(n1, n0, u[uo+j+m-2], d1, d0, v)
-        qlo, r1, r0 = div_3by2(t1, t0, u[uo+j+m-3], d1, d0, v)
-        co1, co0 = m > 2 ? submul_2!(u, uo+j-2, d, do_, m-2, qlo, qhi) :
-                           (zero(Limb), zero(Limb))
-        rr = (DLimb(r1) << 64) | r0
-        co = (DLimb(co1) << 64) | co0
-        brw = rr < co
-        rr -= co
-        qq = (DLimb(qhi) << 64) | qlo
-        while brw   # rare: estimate 1 or 2 too large, add the divisor back
-            qq -= one(DLimb)
-            c = m > 2 ? add_n!(u, uo+j-2, u, uo+j-2, d, do_, m-2) : zero(Limb)
-            s, o1 = Base.add_with_overflow(rr, dd)
-            s, o2 = Base.add_with_overflow(s, DLimb(c))
-            brw = !(o1 | o2)   # 128-bit overflow cancels the borrow
-            rr = s
-        end
-        q[qo+j] = (qq >> 64) % Limb
-        q[qo+j-1] = qq % Limb
-        n1 = (rr >> 64) % Limb
-        n0 = rr % Limb
-        j -= 2
-    end
-    @inbounds if j == 1   # leftover scalar row (3/2 qhat, error ≤ 1)
-        if n1 == d1 && n0 == d0
-            qhat = typemax(Limb)
-            n1, n0 = divrem_bc_degrow!(u, uo, 1, d, do_, m, n0, 0)
-        else
-            qhat, r1, r0 = div_3by2(n1, n0, u[uo+m-1], d1, d0, v)
-            cy = m > 2 ? submul_1!(u, uo, d, do_, m-2, qhat) : zero(Limb)
-            cy1 = Limb(r0 < cy)
-            r0 -= cy
-            cy2 = r1 < cy1
-            r1 -= cy1
-            if cy2   # rare: qhat one too large, add the divisor back
-                qhat -= one(Limb)
-                c = m > 2 ? add_n!(u, uo, u, uo, d, do_, m-2) : zero(Limb)
-                s = ((DLimb(r1) << 64) | r0) + dd + c
-                r1 = (s >> 64) % Limb   # 128-bit overflow cancels the borrow
-                r0 = s % Limb
-            end
-            n1 = r1
-            n0 = r0
-        end
-        q[qo+1] = qhat
-    end
-    @inbounds u[uo+m] = n1
-    @inbounds u[uo+m-1] = n0
-    return qh
-end
-
-# Approximate-quotient schoolbook division: divrem_bc! with every row's submul
-# truncated to the top (row + 2) low divisor limbs — the triangle instead of
-# the square, ~qn²/2 submul work in the balanced case. Same contract except
-# u's contents on return are unspecified (no remainder) and the quotient is a
-# one-sided over-approximation: q_true ≤ q̂ ≤ q_true + 2. Soundness: row j's
-# neglected products are confined to positions ≤ m-4-G (G = 2 guard limbs,
-# constant across rows since the kept length shrinks with j) and total less
-# than qn·β^(m-2-G)/2 ≤ D·β^(-G)/2, while every window read sits at positions
-# ≥ m-2 — so the run is exact schoolbook on a numerator perturbed upward by
-# Δ < D, and each row's divisor is a truncation of d (only ever smaller):
-# the quotient never undershoots and overshoots by at most ⌈Δ/D⌉ + 1 ≤ 2.
-# Add-backs must restore exactly the truncated window that was subtracted.
-function divappr_bc!(q::Memory{Limb}, qo::Int, u::Memory{Limb}, uo::Int, nn::Int,
-                     d::Memory{Limb}, do_::Int, m::Int, v::Limb)
-    qn = nn - m
-    qh = zero(Limb)
-    if cmp_limbs(u, uo+qn, m, d, do_, m) >= 0
-        qh = one(Limb)
-        sub_n!(u, uo+qn, u, uo+qn, d, do_, m)
-    end
-    d1 = @inbounds d[do_+m]
-    d0 = @inbounds d[do_+m-1]
-    dd = (DLimb(d1) << 64) | d0
-    n1 = @inbounds u[uo+nn]
-    n0 = @inbounds u[uo+nn-1]
-    j = qn
-    @inbounds while j >= 2
-        s = m - 4 - j    # neglected low limbs: keep the top (j+2) of d[1..m-2]
-        s < 0 && (s = 0)
+        s = approx ? max(m - 4 - j, 0) : 0
         if n1 == d1 && n0 == d0
             n1, n0 = divrem_bc_degrow!(u, uo, j, d, do_, m, n0, s)
             q[qo+j] = typemax(Limb)
@@ -386,7 +314,7 @@ function divappr_bc!(q::Memory{Limb}, qo::Int, u::Memory{Limb}, uo::Int, nn::Int
         brw = rr < co
         rr -= co
         qq = (DLimb(qhi) << 64) | qlo
-        while brw   # rare: estimate 1 or 2 too large, add the truncated window back
+        while brw   # rare: estimate 1 or 2 too large, add the (kept) divisor back
             qq -= one(DLimb)
             c = m - 2 > s ? add_n!(u, uo+j-2+s, u, uo+j-2+s, d, do_+s, m-2-s) : zero(Limb)
             sm, o1 = Base.add_with_overflow(rr, dd)
@@ -401,7 +329,7 @@ function divappr_bc!(q::Memory{Limb}, qo::Int, u::Memory{Limb}, uo::Int, nn::Int
         j -= 2
     end
     @inbounds if j == 1   # leftover scalar row (3/2 qhat, error ≤ 1)
-        s = m - 5 < 0 ? 0 : m - 5
+        s = approx ? max(m - 5, 0) : 0
         if n1 == d1 && n0 == d0
             qhat = typemax(Limb)
             n1, n0 = divrem_bc_degrow!(u, uo, 1, d, do_, m, n0, s)
@@ -412,7 +340,7 @@ function divappr_bc!(q::Memory{Limb}, qo::Int, u::Memory{Limb}, uo::Int, nn::Int
             r0 -= cy
             cy2 = r1 < cy1
             r1 -= cy1
-            if cy2   # rare: qhat one too large, add the truncated window back
+            if cy2   # rare: qhat one too large, add the (kept) divisor back
                 qhat -= one(Limb)
                 c = m - 2 > s ? add_n!(u, uo+s, u, uo+s, d, do_+s, m-2-s) : zero(Limb)
                 sm = ((DLimb(r1) << 64) | r0) + dd + c
@@ -424,5 +352,7 @@ function divappr_bc!(q::Memory{Limb}, qo::Int, u::Memory{Limb}, uo::Int, nn::Int
         end
         q[qo+1] = qhat
     end
+    @inbounds u[uo+m] = n1
+    @inbounds u[uo+m-1] = n0
     return qh
 end

@@ -11,7 +11,7 @@
 # quotient is long enough for the skipped remainder work to beat the rare
 # fallback mul (bench/bench_sqrt_thr.jl: flat 4-48, gains from lq ≈ 16 up —
 # 4k bits — and no measurable win below; the division there is schoolbook,
-# where divappr_bc!'s triangle is the whole saving).
+# where the approx mode's triangle is the whole saving).
 const SQRT_DIVAPPR_THRESHOLD = 16
 
 # Two separate decisions; collapsing them into one constant costs time at both
@@ -194,6 +194,33 @@ function sqrt_root_cert(s::Memory{Limb}, so::Int, lq::Int, hh::Int, g::Limb)
     return 0
 end
 
+# Shared engine dispatch for the two division sites below: divide the nn-limb
+# numerator at scratch[num+1..num+nn] (top limb the appended zero) by the
+# normalized root S' (hh limbs at s[so+lq]), quotient to scratch[qq+1..].
+# barrett uses the ladder's reciprocal at ivo+lq — at exactly the divisor's
+# width, so no reciprocal work at all; otherwise dc above thr on both operand
+# sides (DC_DIV_THRESHOLD exact, DIVAPPR_DC_THRESHOLD approx — the engine's
+# internal cutoff stays DC_DIV_THRESHOLD either way, since it gates the exact
+# sub-blocks, whose crossover is the lower one), else one schoolbook pass.
+# The dv slot serves as the engines' block scratch.
+function sqrt_div!(scratch::Memory{Limb}, qq::Int, num::Int, nn::Int,
+                   s::Memory{Limb}, so::Int, lq::Int, hh::Int, ivo::Int,
+                   dv::Int, barrett::Bool, approx::Bool, thr::Int)
+    if barrett
+        div_blocks!(scratch, qq, scratch, num, nn, s, so + lq, hh,
+                    MuEngine(scratch, ivo + lq, hh), approx, scratch, dv)
+    else
+        v = @inbounds invert_pi1(s[so+lq+hh], s[so+lq+hh-1])
+        if hh >= thr && nn - hh >= thr
+            div_blocks!(scratch, qq, scratch, num, nn, s, so + lq, hh,
+                        DcEngine(v), approx, scratch, dv)
+        else
+            divrem_bc!(scratch, qq, scratch, num, nn, s, so + lq, hh, v, approx)
+        end
+    end
+    return nothing
+end
+
 # Top-level root-only quotient via the divappr engines: N·β ÷ 2S' with one
 # guard limb ĝ, run as (N·β/2) ÷ S' on the pre-halved num buffer (guard limb
 # ε·2^63) so the divisor is the normalized root itself. Returns (code, rhi):
@@ -220,23 +247,10 @@ function sqrt_appr_top!(s::Memory{Limb}, so::Int, a::Memory{Limb}, ao::Int,
     # appended zero top limb pins the carry-out to zero
     nn = nA + 1
     @inbounds scratch[num+nn] = zero(Limb)
-    if barrett
-        # the ladder already holds inv(S') at exactly this divisor's width, so
-        # the top level's Barrett quotient costs no reciprocal at all. Its ≤ 6
-        # ulp over-approximation is well inside the 32 the certificate allows.
-        div_blocks!(scratch, qq, scratch, num, nn, s, so + lq, hh,
-                    MuEngine(scratch, ivo + lq, hh), true, scratch, dv)
-    else
-        v = @inbounds invert_pi1(s[so+h], s[so+h-1])
-        if hh >= DIVAPPR_DC_THRESHOLD && nn - hh >= DIVAPPR_DC_THRESHOLD
-            # thr stays DC_DIV_THRESHOLD: inside the recursion it cuts off the
-            # *exact* sub-blocks, whose crossover is the lower one.
-            div_blocks!(scratch, qq, scratch, num, nn, s, so + lq, hh,
-                        DcEngine(v), true, scratch, dv)
-        else
-            divappr_bc!(scratch, qq, scratch, num, nn, s, so + lq, hh, v)
-        end
-    end
+    # barrett's ≤ 6 ulp over-approximation is well inside the 32 the
+    # certificate allows
+    sqrt_div!(scratch, qq, num, nn, s, so, lq, hh, ivo, dv, barrett, true,
+              DIVAPPR_DC_THRESHOLD)
     qext = nA - hh + 1               # written limbs: guard, then integer part
     @inbounds for i in qq+lq+2:qq+qext
         scratch[i] != zero(Limb) && return 0, 0
@@ -340,20 +354,8 @@ function sqrtrem!(s::Memory{Limb}, so::Int, a::Memory{Limb}, ao::Int, n::Int,
             # limb pins the extra quotient bit to zero (Q < β^qlen).
             nn = numlen + 1
             @inbounds scratch[num+1+nn] = zero(Limb)
-            if barrett
-                # the child left inv(S') at ivo+lq, at exactly the divisor's
-                # width — no reciprocal work at all on this path
-                div_blocks!(scratch, qq, scratch, num + 1, nn, s, so + lq, hh,
-                            MuEngine(scratch, ivo + lq, hh), false, scratch, dv)
-            else
-                v = @inbounds invert_pi1(s[so+h], s[so+h-1])
-                if hh >= DC_DIV_THRESHOLD && nn - hh >= DC_DIV_THRESHOLD
-                    div_blocks!(scratch, qq, scratch, num + 1, nn, s, so + lq, hh,
-                                DcEngine(v), false, scratch, dv)
-                else
-                    divrem_bc!(scratch, qq, scratch, num + 1, nn, s, so + lq, hh, v)
-                end
-            end
+            sqrt_div!(scratch, qq, num + 1, nn, s, so, lq, hh, ivo, dv,
+                      barrett, false, DC_DIV_THRESHOLD)
             uc = lshift!(a, ao + lq, scratch, num + 1, hh, 1)  # U = 2U₁+ε < 2S'
         else
             divrem!(scratch, qq, scratch, dv, scratch, num + 1, numlen,

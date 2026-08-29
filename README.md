@@ -73,8 +73,8 @@ Dispatch thresholds are benchmark-tuned (`bench/bench_kernels.jl`).
   exact-vs-approximate bottom block. The approximate mode (driven directly by
   `sqrt.jl`, the only consumer) is a one-sided quotient (never below the true
   one, within ~20 ulps dc / 6 mu) that skips all remainder work, via a
-  triangle-truncated basecase (`divappr_bc!`) and a dc recursion that peels
-  the top quotient half exactly.
+  triangle-truncated schoolbook mode (`divrem_bc!` with `approx`) and a dc
+  recursion that peels the top quotient half exactly.
 
 - **Barrett division (`src/invert.jl`):** `invertappr!` is a multi-limb
   approximate reciprocal — the Newton-doubling generalization of the

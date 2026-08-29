@@ -21,7 +21,7 @@ function powermod_limbs(b::Memory{Limb}, lb::Int, e::Integer,
                                               BARRETT_THRESHOLD : BARRETT_EVEN_THRESHOLD))
     odd = !barrett && isodd(@inbounds m[1])
     ninv = odd ? mont_ninv(@inbounds m[1]) : zero(Limb)
-    mured = barrett ? mu_reduce_setup(m, 0, k) : mu_reduce_empty()
+    mured = barrett ? mu_reduce_setup(m, 0, k) : nothing
     nbits = expbits(e)
     w = nbits <= 8 ? 1 : nbits <= 24 ? 2 : nbits <= 80 ? 3 : nbits <= 240 ? 4 : 5
     tsize = 1 << (w - 1)   # table of odd powers b^1, b^3, …, b^(2^w - 1)

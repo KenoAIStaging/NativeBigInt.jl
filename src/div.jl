@@ -116,7 +116,7 @@ end
 # Julia resolves at call time).
 
 # dc engine: v = invert_pi1 of the normalized divisor's top two limbs, thr the
-# recursion cutoff (clamped >= 4 so divrem_dc_n!'s halves keep divrem_bc! at
+# recursion cutoff (clamped >= 4 so the recursion bottoms out in divrem_bc! at
 # m >= 2; non-default only in tests/bench forcing deep recursion).
 struct DcEngine
     v::Limb
@@ -150,51 +150,6 @@ block_scratch_len(::MuEngine, m::Int) = mu_block_scratch_len(m)
 # recursion cutoff, 100-110 also edges out lower values at large m.
 const DC_DIV_THRESHOLD = 100
 
-# Balanced 2n/n divide-and-conquer division step (GMP mpn_dcpi1_div_qr_n).
-# u[uo+1..uo+2n] ÷ d[do_+1..do_+n], d normalized, v = invert_pi1 of its top
-# two limbs. Writes q[qo+1..qo+n], leaves the n-limb remainder in
-# u[uo+1..uo+n], returns the extra top quotient bit qh. scratch holds the
-# n-limb cross products at so; recursion levels share it (a level touches it
-# only after its child returns). thr >= 4 keeps the divrem_bc! basecase at
-# m >= 2.
-#
-# Split n = hi + lo. Dividing the top 2·hi limbs by the top hi limbs of d
-# overshoots the true high quotient block by at most 2 (the ignored d_lo only
-# makes the divisor larger): subtract the cross product q_hi·d_lo — plus
-# qh·d_lo at β^hi for the implicit qh row — and repair each resulting borrow
-# by adding d back and decrementing the block. The same step on the remaining
-# n + lo live limbs yields the low block. The pi1 inverse stays valid down
-# the recursion because every divisor suffix keeps d's top two limbs.
-function divrem_dc_n!(q::Memory{Limb}, qo::Int, u::Memory{Limb}, uo::Int,
-                      d::Memory{Limb}, do_::Int, n::Int, v::Limb,
-                      scratch::Memory{Limb}, so::Int, thr::Int)
-    lo = n >> 1
-    hi = n - lo
-    qh = hi < thr ? divrem_bc!(q, qo + lo, u, uo + 2lo, 2hi, d, do_ + lo, hi, v) :
-                    divrem_dc_n!(q, qo + lo, u, uo + 2lo, d, do_ + lo, hi, v, scratch, so, thr)
-    mul!(scratch, so, q, qo + lo, hi, d, do_, lo)          # q_hi × d_lo, n limbs
-    cy = sub_n!(u, uo + lo, u, uo + lo, scratch, so, n)
-    if qh != zero(Limb)
-        cy += sub_n!(u, uo + n, u, uo + n, d, do_, lo)
-    end
-    while cy != zero(Limb)
-        qh -= sub_1!(q, qo + lo, q, qo + lo, hi, one(Limb))
-        cy -= add_n!(u, uo + lo, u, uo + lo, d, do_, n)
-    end
-    ql = lo < thr ? divrem_bc!(q, qo, u, uo + hi, 2lo, d, do_ + hi, lo, v) :
-                    divrem_dc_n!(q, qo, u, uo + hi, d, do_ + hi, lo, v, scratch, so, thr)
-    mul!(scratch, so, d, do_, hi, q, qo, lo)               # q_lo × d_lo', hi >= lo
-    cy = sub_n!(u, uo, u, uo, scratch, so, n)
-    if ql != zero(Limb)
-        cy += sub_n!(u, uo + lo, u, uo + lo, d, do_, hi)
-    end
-    while cy != zero(Limb)
-        sub_1!(q, qo, q, qo, lo, one(Limb))   # borrow folds into ql's correction
-        cy -= add_n!(u, uo, u, uo, d, do_, n)
-    end
-    return qh
-end
-
 # Schoolbook → cross-product crossover for the *leading partial* block, which
 # is a different question from the balanced DC_DIV_THRESHOLD and needs its own
 # constant. The schoolbook arm costs O(s·m) with row-kernel constants; the
@@ -213,23 +168,39 @@ end
 #
 # 48 rather than 32: at 32 the cross-product arm is still behind (m = 2048 went
 # 16.6us -> 21.1us), and the crossover measures out at ~44.
-# Must stay >= 4 so divrem_dc_n!'s halves keep divrem_bc! at m >= 2.
+# Must stay >= 4 so the recursion bottoms out in divrem_bc! at m >= 2.
 const DC_DIV_PARTIAL_THRESHOLD = 48
 
-# One exact block: s quotient limbs (s <= m) for the m+s-limb window
+# One exact dc block: s quotient limbs (s <= m) for the m+s-limb window
 # u[uo+1..uo+m+s], remainder left in u[uo+1..uo+m], returns qh, the extra top
-# quotient bit. This dc method is GMP mpn_dcpi1_div_qr's qn < dn arm: s == m
-# is the balanced step; very small s stays schoolbook (O(s·m), one-off);
-# otherwise divide the top 2s limbs by the top s limbs of d, then subtract the
-# cross product q·d_lo with the same add-back repair as divrem_dc_n!.
+# quotient bit. scratch holds the m-limb cross product at so; recursion levels
+# share it (a level touches it only after its child returns).
+#
+# The balanced step (s == m, GMP mpn_dcpi1_div_qr_n) is two partial blocks of
+# hi + lo = m; below thr one schoolbook pass over the 2m window wins outright.
+#
+# The partial step (s < m, GMP mpn_dcpi1_div_qr's qn < dn arm): very small s
+# stays schoolbook (O(s·m), one-off); otherwise divide the top 2s limbs by the
+# top s limbs of d — which overshoots the true block by at most 2, since the
+# ignored d_lo only makes the divisor larger — then subtract the cross product
+# q·d_lo (plus qh·d_lo at β^s for the implicit qh row) and repair each
+# resulting borrow by adding d back and decrementing the block. The pi1
+# inverse stays valid down the recursion because every divisor suffix keeps
+# d's top two limbs.
 function div_block!(e::DcEngine, q::Memory{Limb}, qo::Int, u::Memory{Limb}, uo::Int,
                     d::Memory{Limb}, do_::Int, m::Int, s::Int,
                     scratch::Memory{Limb}, so::Int)
-    s == m && return divrem_dc_n!(q, qo, u, uo, d, do_, m, e.v, scratch, so, e.thr)
+    if s == m
+        m < e.thr && return divrem_bc!(q, qo, u, uo, 2m, d, do_, m, e.v)
+        lo = m >> 1
+        hi = m - lo
+        qh = div_block!(e, q, qo + lo, u, uo + lo, d, do_, m, hi, scratch, so)
+        div_block!(e, q, qo, u, uo, d, do_, m, lo, scratch, so)
+        return qh
+    end
     s < min(e.thr, DC_DIV_PARTIAL_THRESHOLD) &&
         return divrem_bc!(q, qo, u, uo, m + s, d, do_, m, e.v)
-    qh = divrem_dc_n!(q, qo, u, uo + (m - s), d, do_ + (m - s), s, e.v,
-                      scratch, so, e.thr)
+    qh = div_block!(e, q, qo, u, uo + (m - s), d, do_ + (m - s), s, s, scratch, so)
     if s >= m - s                                          # q × d_lo, m limbs
         mul!(scratch, so, q, qo, s, d, do_, m - s)
     else
@@ -246,13 +217,13 @@ function div_block!(e::DcEngine, q::Memory{Limb}, qo::Int, u::Memory{Limb}, uo::
     return qh
 end
 
-# Schoolbook → divide-and-conquer crossover for the *approximate* engines. It is
-# far higher than DC_DIV_THRESHOLD because divappr_bc! truncates every row's
-# submul to the triangle (kernels/div.jl:345), a constant-factor saving that
+# Schoolbook → divide-and-conquer crossover for the *approximate* engines. It
+# is far higher than DC_DIV_THRESHOLD because divrem_bc!'s approx mode
+# truncates every row's submul to the triangle, a constant-factor saving that
 # the approximate dc path largely forfeits — all its blocks above the
 # bottom-most run the exact div_block!, remainder work included.
 #
-# divappr_bc! vs the dc driver on balanced nn = 2m+1, by divisor limbs m:
+# approx schoolbook vs the dc driver on balanced nn = 2m+1, by divisor limbs m:
 #
 #   m      100   128   192   256   384   512   640   768   896
 #   ratio  0.87  0.81  0.90  0.91  1.02  1.09  1.31  1.47  1.50
@@ -294,7 +265,7 @@ function divappr_block!(e::DcEngine, q::Memory{Limb}, qo::Int, u::Memory{Limb}, 
         return divappr_block!(e, q, qo, u, uo + drop, d, do_ + drop, s + 2, s,
                               scratch, so)
     end
-    s < e.thr && return divappr_bc!(q, qo, u, uo, m + s, d, do_, m, e.v)
+    s < e.thr && return divrem_bc!(q, qo, u, uo, m + s, d, do_, m, e.v, true)
     s2 = s >> 1
     qh = div_block!(e, q, qo + s2, u, uo + s2, d, do_, m, s - s2, scratch, so)
     c = divappr_block!(e, q, qo, u, uo, d, do_, m, s2, scratch, so)

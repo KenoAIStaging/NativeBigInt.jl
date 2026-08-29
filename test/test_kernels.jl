@@ -602,8 +602,8 @@ end
     end
 end
 
-@testset "divappr_bc! approximate quotient" begin
-    using NativeBigInt: divappr_bc!
+@testset "divrem_bc! approx-mode quotient" begin
+    using NativeBigInt: divrem_bc!
     rng = MersenneTwister(0xd1a)
     hib = UInt64(1) << 63
     β = big(1) << 64
@@ -621,7 +621,7 @@ end
         end
         q = Memory{UInt64}(undef, nn - m)
         v = invert_pi1(d[m], d[m-1])
-        qh = divappr_bc!(q, 0, u, 0, nn, d, 0, m, v)
+        qh = divrem_bc!(q, 0, u, 0, nn, d, 0, m, v, true)
         got_q = (big(qh) << (64 * (nn - m))) | toref(q, 0, nn - m)
         return got_q - uref ÷ dref
     end
