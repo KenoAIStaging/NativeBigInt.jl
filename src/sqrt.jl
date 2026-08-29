@@ -7,7 +7,7 @@
 # ---- tuning -----------------------------------------------------------------
 
 # Root-only top level switches from exact divrem! (whose remainder doubles as
-# the nonnegativity certificate) to divappr_dc! + guard-limb certificate once the
+# the nonnegativity certificate) to the divappr engines + guard-limb certificate once the
 # quotient is long enough for the skipped remainder work to beat the rare
 # fallback mul (bench/bench_sqrt_thr.jl: flat 4-48, gains from lq ≈ 16 up —
 # 4k bits — and no measurable win below; the division there is schoolbook,
@@ -43,7 +43,7 @@ const SQRT_DIVAPPR_THRESHOLD = 16
 # 1024-limb isqrt by 27%; gating both on 1024 gave up the 4096-limb win and left
 # 8192 at 346us where 256 reached 336us.
 #
-# isqrt us, ladder against plain divappr_dc!, by top-level divisor:
+# isqrt us, ladder against the plain approximate dc driver, by top-level divisor:
 #
 #   hh        704    768    960    1024   2048
 #   dc       100.8  117.7  179.0  171.5  387.5
@@ -81,7 +81,7 @@ function sqrt_inv_base(h::Int)
     lq = h >> 1
     hh = h - lq
     return (h + 2) + (lq + 3) +
-           max(h + 3 + 2hh, mu_div_step_scratch_len(hh),
+           max(h + 3 + 2hh, mu_block_scratch_len(hh),
                invertappr_step_scratch_len(h), invertappr_scratch_len(h))
 end
 
@@ -164,7 +164,7 @@ end
 # plus perfect squares).
 function sqrt_root_cert(s::Memory{Limb}, so::Int, lq::Int, hh::Int, g::Limb)
     # The divappr engines over-approximate by ≤ ~20 ulps (derivation at
-    # divappr_dc_partial!). Kept loose at 32; sqrt_appr_top! rejects on the same
+    # divappr_block!'s dc method). Kept loose at 32; sqrt_appr_top! rejects on the same
     # value, so the two must agree.
     E = Limb(32)
     db = @inbounds s[so+lq+hh]
@@ -224,15 +224,15 @@ function sqrt_appr_top!(s::Memory{Limb}, so::Int, a::Memory{Limb}, ao::Int,
         # the ladder already holds inv(S') at exactly this divisor's width, so
         # the top level's Barrett quotient costs no reciprocal at all. Its ≤ 6
         # ulp over-approximation is well inside the 32 the certificate allows.
-        mu_divappr_core!(scratch, qq, scratch, num, nn, s, so + lq, hh,
-                         scratch, ivo + lq, scratch, dv)
+        div_blocks!(scratch, qq, scratch, num, nn, s, so + lq, hh,
+                    MuEngine(scratch, ivo + lq, hh), true, scratch, dv)
     else
         v = @inbounds invert_pi1(s[so+h], s[so+h-1])
         if hh >= DIVAPPR_DC_THRESHOLD && nn - hh >= DIVAPPR_DC_THRESHOLD
             # thr stays DC_DIV_THRESHOLD: inside the recursion it cuts off the
             # *exact* sub-blocks, whose crossover is the lower one.
-            divappr_dc!(scratch, qq, scratch, num, nn, s, so + lq, hh, v,
-                        DC_DIV_THRESHOLD, scratch, dv)
+            div_blocks!(scratch, qq, scratch, num, nn, s, so + lq, hh,
+                        DcEngine(v), true, scratch, dv)
         else
             divappr_bc!(scratch, qq, scratch, num, nn, s, so + lq, hh, v)
         end
@@ -311,7 +311,7 @@ function sqrtrem!(s::Memory{Limb}, so::Int, a::Memory{Limb}, ao::Int, n::Int,
                   ivo < 0 ? -1 : ivo + lq, barrett)
     num = sco                    # h+2 limbs: ×β guard, then (c1, R', A1)/2
     qq = sco + h + 2             # lq+3 limbs: quotient Q (divappr: ĝ below Q)
-    dv = sco + h + lq + 5        # ≤ h+3+2hh limbs: divrem!/divappr_dc! scratch
+    dv = sco + h + lq + 5        # ≤ h+3+2hh limbs: divrem!/div_blocks! scratch
                                  # (the divisor S' is normalized, so its copy
                                  # slot inside the contract is never touched);
                                  # doubles as U's slot — divrem! leaves the
@@ -343,13 +343,13 @@ function sqrtrem!(s::Memory{Limb}, so::Int, a::Memory{Limb}, ao::Int, n::Int,
             if barrett
                 # the child left inv(S') at ivo+lq, at exactly the divisor's
                 # width — no reciprocal work at all on this path
-                mu_divrem_core!(scratch, qq, scratch, num + 1, nn, s, so + lq, hh,
-                                scratch, ivo + lq, hh, scratch, dv)
+                div_blocks!(scratch, qq, scratch, num + 1, nn, s, so + lq, hh,
+                            MuEngine(scratch, ivo + lq, hh), false, scratch, dv)
             else
                 v = @inbounds invert_pi1(s[so+h], s[so+h-1])
                 if hh >= DC_DIV_THRESHOLD && nn - hh >= DC_DIV_THRESHOLD
-                    divrem_dc!(scratch, qq, scratch, num + 1, nn, s, so + lq, hh, v,
-                               DC_DIV_THRESHOLD, scratch, dv)
+                    div_blocks!(scratch, qq, scratch, num + 1, nn, s, so + lq, hh,
+                                DcEngine(v), false, scratch, dv)
                 else
                     divrem_bc!(scratch, qq, scratch, num + 1, nn, s, so + lq, hh, v)
                 end

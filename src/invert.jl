@@ -81,7 +81,7 @@ end
 # scratch;
 # d is read-only. scratch needs invertappr_scratch_len(n, thr) limbs at sco
 # (allocated when not passed). thr is the basecase crossover, exposed only so
-# tests can drive the recursion at small n (cf. divrem_dc!'s thr); clamped to
+# tests can drive the recursion at small n (cf. DcEngine's thr); clamped to
 # >= 4, so the recursion body only ever runs at n >= 5. That is what lets the
 # split be a bare (n>>1)+1 (it is already < n by then) and the assembly window
 # below assume h >= 3.
@@ -216,15 +216,15 @@ end
 
 # ---- Barrett (mu) division ------------------------------------------------
 # Newton/Barrett division on top of invertappr!: GMP's mpn_mu_div_qr. Where
-# divrem_dc! spends a recursive division per m-limb quotient block, this spends
-# two multiplications, having paid for one reciprocal up front. It is therefore
-# an O(M(n)) algorithm against divrem_dc!'s O(M(n)·log n), which is why the
+# the dc tier spends a recursive division per m-limb quotient block, this
+# spends two multiplications, having paid for one reciprocal up front. It is
+# therefore an O(M(n)) algorithm against dc's O(M(n)·log n), which is why the
 # crossover exists at all and why it keeps widening: measured D/M is 4.3 at 512,
 # 6.1 at 2048, 7.8 at 8192.
 
-# Scratch limbs mu_div_step! needs at so: the m+s+2-limb quotient-estimate
-# product followed by the m+s-limb q̂·d product. s <= m.
-mu_div_step_scratch_len(m::Int) = 4m + 2
+# Scratch limbs one mu block (the MuEngine methods below) needs at so: the
+# m+s+2-limb quotient-estimate product followed by the m+s-limb q̂·d product.
+mu_block_scratch_len(m::Int) = 4m + 2
 
 # Barrett-vs-divrem! crossover. The reciprocal is paid once and amortizes over
 # k = ceil(qn/m) blocks, so the crossover moves with the *shape*, not just the
@@ -266,22 +266,23 @@ mu_div_worthwhile(qn::Int, m::Int) =
               (m >= MU_DIV_2BLK_THRESHOLD && qn >= 2m) ||
               (m >= MU_DIV_4BLK_THRESHOLD && qn >= 4m))
 
-# One Barrett block: divide the m+s-limb window u[uo+1..uo+m+s] by the
-# normalized m-limb d, given iv, the m-limb approximate reciprocal of d
-# (so Z = β^m + iv ≈ β^2m/d). Requires U < d·β^s, i.e. the quotient fits in s
-# limbs, and 1 <= s <= m. Writes q[qo+1..qo+s] and leaves the m-limb remainder
-# in u[uo+1..uo+m]; the window above that is left zero.
+# One Barrett block (div_block!'s MuEngine method below): divide the m+s-limb
+# window u[uo+1..uo+m+s] by the normalized m-limb d, given the approximate
+# reciprocal iv (so Z = β^m + iv ≈ β^2m/d). Requires U < d·β^s, i.e. the
+# quotient fits in s limbs. Leaves the m-limb remainder in u[uo+1..uo+m]; the
+# window above that is left zero.
 #
 #     U_hi = ⌊U/β^(m-1)⌋   (s+1 limbs)
 #     q̂    = ⌊U_hi·Z/β^(m+1)⌋
 #
 # q̂ never overshoots: Z ≤ ⌊(β^2m - 1)/d⌋ < β^2m/d, so q̂ ≤ U/d and the fixups
-# below are add-only. Undershoot is at most 5 — one from truncating U to U_hi,
+# are add-only. Undershoot is at most 5 — one from truncating U to U_hi,
 # up to three from Z's own error (invertappr!'s 1 ulp plus the two floors relating
 # it to β^2m/d), and one more from U/β^2m < 1 — so the loop is O(1) passes.
 #
-# Split into the estimate and the fixup so mu_divappr_core! can reuse the
-# estimate alone for its bottom block, where no remainder is wanted.
+# Split into the estimate and the fixup: divappr_block! reuses the estimate
+# alone, where no remainder is wanted, and the ≤ 5 undershoot is what its +5
+# lift relies on.
 @inline function mu_div_est!(q::Memory{Limb}, qo::Int, u::Memory{Limb}, uo::Int, s::Int,
                              m::Int, iv::Memory{Limb}, ivo::Int, ii::Int,
                              scratch::Memory{Limb}, po::Int)
@@ -309,10 +310,10 @@ mu_div_worthwhile(qn::Int, m::Int) =
     return nothing
 end
 
-function mu_div_step!(q::Memory{Limb}, qo::Int, u::Memory{Limb}, uo::Int, s::Int,
-                      d::Memory{Limb}, do_::Int, m::Int,
-                      iv::Memory{Limb}, ivo::Int, ii::Int,
-                      scratch::Memory{Limb}, so::Int)
+function div_block!(e::MuEngine, q::Memory{Limb}, qo::Int, u::Memory{Limb}, uo::Int,
+                    d::Memory{Limb}, do_::Int, m::Int, s::Int,
+                    scratch::Memory{Limb}, so::Int)
+    iv, ivo, ii = e.iv, e.ivo, e.ii
     po = so                            # P: s+ii+2 limbs
     wo = so + s + ii + 2               # W: m+s limbs
     mu_div_est!(q, qo, u, uo, s, m, iv, ivo, ii, scratch, po)
@@ -338,84 +339,24 @@ function mu_div_step!(q::Memory{Limb}, qo::Int, u::Memory{Limb}, uo::Int, s::Int
         u[uo+m+1] -= b
         add_1!(q, qo, q, qo, s, one(Limb))
     end
-    return nothing
+    return zero(Limb)   # U < d·β^s: a mu block never sets qh
 end
 
-# Blocked Barrett division with divrem_dc!'s contract: u (nn limbs, destroyed;
-# m-limb remainder left in u[uo+1..uo+m]) ÷ normalized m-limb d, with iv the
-# m-limb approximate reciprocal; writes q[1..nn-m]. Requires nn > m and
-# Q < β^(nn-m) — the caller's appended limb guarantees it, so there is no qh.
-#
-# The quotient is peeled from the top exactly as divrem_dc! peels it: a leading
-# partial block of s limbs (qn reduced mod m into [1, m]), then full m-limb
-# blocks. That is what supplies mu_div_step!'s U < d·β^s precondition — the
-# leading window inherits it from Q < β^qn, and every later window tops out
-# with the previous block's remainder, which is < d.
-function mu_divrem_core!(q::Memory{Limb}, qo::Int, u::Memory{Limb}, uo::Int, nn::Int,
-                         d::Memory{Limb}, do_::Int, m::Int,
-                         iv::Memory{Limb}, ivo::Int, ii::Int,
-                         scratch::Memory{Limb}, so::Int)
-    qn = nn - m
-    if ii < m
-        # short quotient: one block against a reciprocal of only d's top ii
-        # limbs (GMP's mpn_mu_div_qr_choose_in). Blocking would need ii ≥ s+2
-        # per block, which a single block of s = qn already satisfies.
-        return mu_div_step!(q, qo, u, uo, qn, d, do_, m, iv, ivo, ii, scratch, so)
-    end
-    s = qn <= m ? qn : qn - m * ((qn - 1) ÷ m)
-    off = qn - s
-    mu_div_step!(q, qo + off, u, uo + off, s, d, do_, m, iv, ivo, ii, scratch, so)
-    while off > 0
-        off -= m
-        mu_div_step!(q, qo + off, u, uo + off, m, d, do_, m, iv, ivo, ii, scratch, so)
-    end
-    return nothing
+# Approximate bottom block: the estimate alone — the whole saving over the
+# exact block is skipping its q̂·d product and correction — lifted by +5 to the
+# one-sided form. Requires ii == m, which also keeps the add-back overshoot
+# out of the bound.
+function divappr_block!(e::MuEngine, q::Memory{Limb}, qo::Int, u::Memory{Limb}, uo::Int,
+                        d::Memory{Limb}, do_::Int, m::Int, s::Int,
+                        scratch::Memory{Limb}, so::Int)
+    mu_div_est!(q, qo, u, uo, s, m, e.iv, e.ivo, e.ii, scratch, so)
+    return add_1!(q, qo, q, qo, s, Limb(5))
 end
 
-# Barrett approximate quotient, with divappr_dc!'s contract: u (nn limbs,
-# destroyed, holds no remainder afterwards) ÷ normalized m-limb d, writing
-# qn = nn-m limbs to q with
-#
-#     q_true ≤ q̂ ≤ q_true + 6
-#
-# Requires nn > m and Q < β^qn (the caller's appended zero limb).
-#
-# Every block above the bottom-most runs the full mu_div_step! — their
-# remainders feed the blocks below — and only the bottom one stops at the
-# estimate, skipping its q̂·d product and correction entirely. That is the whole
-# saving over mu_divrem!: one of the two multiplications per block, for one
-# block.
-#
-# The estimate undershoots by at most 5, so adding 5 turns it into the
-# one-sided *over*-approximation divappr's callers require (sqrt.jl's guard-limb
-# certificate depends on the sign).
-#
-# iv is the full m limbs and is supplied, never built here: sqrt's ladder
-# already holds inv of exactly this divisor (the child's root), so its only
-# caller pays nothing for it. Using the full width also keeps the estimate free
-# of the truncated-divisor overshoot that would complicate the bound above.
-# scratch needs mu_div_step_scratch_len(m) limbs at wso.
-function mu_divappr_core!(q::Memory{Limb}, qo::Int, u::Memory{Limb}, uo::Int, nn::Int,
-                          d::Memory{Limb}, do_::Int, m::Int,
-                          iv::Memory{Limb}, ivo::Int,
-                          scratch::Memory{Limb}, wso::Int)
-    qn = nn - m
-    s = qn <= m ? qn : qn - m * ((qn - 1) ÷ m)
-    off = qn - s
-    if off > 0
-        mu_div_step!(q, qo + off, u, uo + off, s, d, do_, m, iv, ivo, m, scratch, wso)
-        while off > m
-            off -= m
-            mu_div_step!(q, qo + off, u, uo + off, m, d, do_, m, iv, ivo, m, scratch, wso)
-        end
-        off -= m
-        s = m
-    end
-    # bottom block: estimate only, then lift to a one-sided over-approximation
-    mu_div_est!(q, qo, u, uo, s, m, iv, ivo, m, scratch, wso)
-    add_1!(q, qo, q, qo, qn, Limb(5))
-    return nothing
-end
+# The short-quotient case (ii < m, GMP's mpn_mu_div_qr_choose_in, reciprocal
+# of only d's top ii limbs) needs no special arm in div_blocks!: qn < m
+# already makes it a single block of s = qn, and blocking would need ii ≥ s+2
+# per block, which that satisfies.
 
 # Reciprocal size: the full divisor when the quotient is at least as long (the
 # blocked case, where a shorter reciprocal would only force more blocks and so
@@ -426,51 +367,21 @@ mu_inv_size(qn::Int, m::Int) = qn >= m ? m : min(m, qn + 2)
 
 # Scratch limbs mu_divrem! needs at sco: the n+1-limb shifted numerator, the
 # m-limb shifted divisor, the m-limb reciprocal, then whichever of the
-# reciprocal's own scratch and the step scratch is larger (they are used in
+# reciprocal's own scratch and the block scratch is larger (they are used in
 # sequence, never at once).
 mu_divrem_scratch_len(n::Int, m::Int) =
-    (n + 1) + 2m + max(invertappr_scratch_len(m), mu_div_step_scratch_len(m))
+    (n + 1) + 2m + max(invertappr_scratch_len(m), mu_block_scratch_len(m))
 
 # Barrett quotient/remainder with divrem!'s operand contract: a (n limbs) ÷ d
 # (m limbs, d[m] ≠ 0), n > m ≥ 2. Writes n-m+1 quotient limbs (top may be zero)
 # and m remainder limbs; a is not modified. scratch needs
 # mu_divrem_scratch_len(n, m) limbs at sco (allocated when not passed).
-function mu_divrem!(q::Memory{Limb}, qo::Int, r::Memory{Limb}, ro::Int,
-                    a::Memory{Limb}, ao::Int, n::Int, d::Memory{Limb}, do_::Int, m::Int,
-                    scratch::Union{Memory{Limb},Nothing}=nothing, sco::Int=0)
-    if scratch === nothing
-        scratch = Memory{Limb}(undef, mu_divrem_scratch_len(n, m))
-        sco = 0
-    end
-    l = leading_zeros(@inbounds d[do_+m])
-    nn = n + 1
-    uo = sco
-    dvo = sco + nn
-    ivo = sco + nn + m
-    wso = sco + nn + 2m
-    # The appended top limb is what makes Q < β^(nn-m), which mu_divrem_core!
-    # relies on for its leading block (cf. divrem!).
-    if l == 0
-        copyto!(scratch, uo + 1, a, ao + 1, n)
-        @inbounds scratch[uo+nn] = zero(Limb)
-        dv, dvv = d, do_
-    else
-        @inbounds scratch[uo+nn] = lshift!(scratch, uo, a, ao, n, l)
-        lshift!(scratch, dvo, d, do_, m, l)
-        dv, dvv = scratch, dvo
-    end
-    # The top ii limbs of dv are normalized too (same top limb), so invertappr!'s
-    # precondition carries over unchanged.
-    ii = mu_inv_size(n - m + 1, m)
-    invertappr!(scratch, ivo, dv, dvv + (m - ii), ii, scratch, wso)
-    mu_divrem_core!(q, qo, scratch, uo, nn, dv, dvv, m, scratch, ivo, ii, scratch, wso)
-    if l == 0
-        copyto!(r, ro + 1, scratch, uo + 1, m)
-    else
-        rshift!(r, ro, scratch, uo, m, l)
-    end
-    return nothing
-end
+# A thin forced-mu entry over div.jl's shared normalize/divide/denormalize
+# skeleton — divrem! takes the same path when mu_div_worthwhile says so.
+mu_divrem!(q::Memory{Limb}, qo::Int, r::Memory{Limb}, ro::Int,
+           a::Memory{Limb}, ao::Int, n::Int, d::Memory{Limb}, do_::Int, m::Int,
+           scratch::Union{Memory{Limb},Nothing}=nothing, sco::Int=0) =
+    div_entry!(q, qo, r, ro, a, ao, n, d, do_, m, true, scratch, sco)
 
 # ---- Barrett (mu) reduction ------------------------------------------------
 # T mod m for a *fixed* modulus: one reciprocal built per modulus and reused
@@ -479,8 +390,9 @@ end
 # — and the only reason a separate entry point exists at all.
 #
 # Two multiplications per reduction (the estimate and q̂·d), same as a
-# hand-rolled Barrett (HAC 14.42), but sharing invertappr! and mu_div_step!
-# with the division tier instead of carrying a second reciprocal convention.
+# hand-rolled Barrett (HAC 14.42), but sharing invertappr! and the mu
+# div_block! with the division tier instead of carrying a second reciprocal
+# convention.
 
 # powermod_limbs switches its reduction to Barrett at these modulus sizes
 # (limbs), tuned by bench/bench_kernels.jl barrett. The baselines differ by
@@ -514,14 +426,15 @@ const BARRETT_EVEN_THRESHOLD = 160
 struct MuReduce
     l::Int                  # normalizing shift of m
     mp::Memory{Limb}        # m << l: k limbs, top bit set
-    iv::Memory{Limb}        # invertappr! of mp, k limbs
+    eng::MuEngine           # invertappr! of mp, k limbs
     q::Memory{Limb}         # discarded quotient, k limbs
     u::Memory{Limb}         # shifted numerator, 2k limbs, destroyed per call
-    scratch::Memory{Limb}   # mu_div_step! working space
+    scratch::Memory{Limb}   # div_block! working space
 end
 
 mu_reduce_empty() =
-    MuReduce(0, EMPTY_LIMBS, EMPTY_LIMBS, EMPTY_LIMBS, EMPTY_LIMBS, EMPTY_LIMBS)
+    MuReduce(0, EMPTY_LIMBS, MuEngine(EMPTY_LIMBS, 0, 0), EMPTY_LIMBS,
+             EMPTY_LIMBS, EMPTY_LIMBS)
 
 # Once-per-modulus setup for the k-limb m (m[k] ≠ 0, k ≥ 2). Normalizing here
 # rather than per reduction is what lets invertappr! be called once: its Newton
@@ -537,14 +450,15 @@ function mu_reduce_setup(m::Memory{Limb}, mo::Int, k::Int)
     end
     iv = Memory{Limb}(undef, k)
     invertappr!(iv, 0, mp, 0, k)
-    return MuReduce(l, mp, iv, Memory{Limb}(undef, k), Memory{Limb}(undef, 2k),
-                    Memory{Limb}(undef, mu_div_step_scratch_len(k)))
+    return MuReduce(l, mp, MuEngine(iv, 0, k), Memory{Limb}(undef, k),
+                    Memory{Limb}(undef, 2k),
+                    Memory{Limb}(undef, mu_block_scratch_len(k)))
 end
 
 # r[1..k] = T mod m (unnormalized), T = t[to+1..to+2k].
 #
-# Requires T < m·β^k, which is narrower than a general T < β^2k: it is
-# mu_div_step!'s U < d·β^s precondition at s = k, and it is what makes this one
+# Requires T < m·β^k, which is narrower than a general T < β^2k: it is the mu
+# block's U < d·β^s precondition at s = k, and it is what makes this one
 # block instead of two. powermod's T = x·y with x, y < m satisfies it (T < m²
 # ≤ m·β^k) — a caller with arbitrary T < β^2k must use divrem! instead.
 #
@@ -558,7 +472,7 @@ function mu_reduce!(r::Memory{Limb}, ro::Int, t::Memory{Limb}, to::Int, k::Int,
     else
         lshift!(st.u, 0, t, to, 2k, st.l)
     end
-    mu_div_step!(st.q, 0, st.u, 0, k, st.mp, 0, k, st.iv, 0, k, st.scratch, 0)
+    div_block!(st.eng, st.q, 0, st.u, 0, st.mp, 0, k, k, st.scratch, 0)
     if st.l == 0
         copyto!(r, ro + 1, st.u, 1, k)
     else

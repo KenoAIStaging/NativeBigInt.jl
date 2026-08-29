@@ -67,12 +67,14 @@ Dispatch thresholds are benchmark-tuned (`bench/bench_kernels.jl`).
   `DC_DIV_PARTIAL_THRESHOLD` on the quotient, since the leading partial
   block's cross-product arm beats schoolbook as soon as `mul!` is
   subquadratic. Sharing one threshold cost up to 2.1× on short quotients over
-  large divisors. `divappr_dc!`/`divappr_bc!` are the quotient-only
-  engines (driven directly by `sqrt.jl`, the only consumer): a
-  one-sided approximate quotient (never below the true one, within
-  ~20 ulps) that skips all remainder work, via a
-  triangle-truncated basecase and a dc recursion that peels the top quotient
-  half exactly.
+  large divisors. All four tier/mode combinations run through one
+  quotient-peeling driver, `div_blocks!`, parametrized by engine (`DcEngine`
+  here, Barrett `MuEngine` over `invert.jl`'s reciprocal) and by an
+  exact-vs-approximate bottom block. The approximate mode (driven directly by
+  `sqrt.jl`, the only consumer) is a one-sided quotient (never below the true
+  one, within ~20 ulps dc / 6 mu) that skips all remainder work, via a
+  triangle-truncated basecase (`divappr_bc!`) and a dc recursion that peels
+  the top quotient half exactly.
 
 - **Barrett division (`src/invert.jl`):** `invertappr!` is a multi-limb
   approximate reciprocal — the Newton-doubling generalization of the

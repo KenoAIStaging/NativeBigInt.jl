@@ -1,6 +1,6 @@
 # Algorithm tests
 using NativeBigInt: Limb, add_carry!, cmp_padded, abs_diff!, kar_scratch_len, MUL_KARATSUBA_THRESHOLD, divrem!,
-    divrem_dc!, invert_pi1, DC_DIV_THRESHOLD,
+    div_blocks!, DcEngine, MuEngine, invert_pi1, DC_DIV_THRESHOLD,
     invertappr!, invertappr_scratch_len, INV_NEWTON_THRESHOLD,
     mu_divrem!
 using Random: MersenneTwister
@@ -196,19 +196,19 @@ end
     end
 end
 
-@testset "divrem_dc!" begin
+@testset "div_blocks! (exact dc)" begin
     rng = MersenneTwister(37)
 
-    # Direct divrem_dc! check with a forced-low threshold to exercise deep
-    # recursion. dref must be normalized (top bit of limb m set); numerator is
-    # nn limbs with the top limb possibly nonzero (qh convention as divrem_bc!).
+    # Direct exact-dc div_blocks! check with a forced-low threshold to exercise
+    # deep recursion. dref must be normalized (top bit of limb m set); numerator
+    # is nn limbs with the top limb possibly nonzero (qh convention as divrem_bc!).
     function checkdc(aref::BigInt, dref::BigInt, nn::Int, m::Int, thr::Int)
         u = afrombig(aref, nn)
         d = afrombig(dref, m)
         v = invert_pi1(d[m], d[m-1])
         qn = nn - m
         q = Memory{UInt64}(undef, qn)
-        qh = divrem_dc!(q, 0, u, 0, nn, d, 0, m, v, thr)
+        qh = div_blocks!(q, 0, u, 0, nn, d, 0, m, DcEngine(v, thr), false)
         qref, rref = divrem(aref, dref)
         @test (big(qh) << (64qn)) + atoref(q, 0, qn) == qref
         @test atoref(u, 0, m) == rref
@@ -475,7 +475,7 @@ end
 @testset "mu_reduce!" begin
     rng = MersenneTwister(0xba44e77)
 
-    # mu_reduce! requires T < m·β^k (mu_div_step!'s U < d·β^s at s = k), which
+    # mu_reduce! requires T < m·β^k (the mu block's U < d·β^s at s = k), which
     # is narrower than the general T < β^2k the old hand-rolled Barrett took: a
     # caller with arbitrary T must go through divrem!. Every T below respects
     # it, and the helper asserts it rather than trusting the construction.
@@ -646,9 +646,9 @@ using NativeBigInt: HgcdMatrix, hgcd_matrix_cap, hgcd!, gcd!, gcdext!, normlen
     end
 end
 
-@testset "divappr_dc!/divappr_bc! approximate quotient" begin
-    using NativeBigInt: divappr_dc!, divappr_bc!, invert_pi1, lshift!,
-        magnitude_bits, mu_divappr_core!, mu_div_step_scratch_len, invertappr!,
+@testset "div_blocks! (approx)/divappr_bc! approximate quotient" begin
+    using NativeBigInt: divappr_bc!, invert_pi1, lshift!,
+        magnitude_bits, mu_block_scratch_len, invertappr!,
         invertappr_scratch_len
     rng = MersenneTwister(0xd1ab)
     hib = UInt64(1) << 63
@@ -668,7 +668,7 @@ end
         end
         scratch = Memory{UInt64}(undef, n + 1 + 3m + m +
                                         max(invertappr_scratch_len(m),
-                                            mu_div_step_scratch_len(m)))
+                                            mu_block_scratch_len(m)))
         if m <= 2 || magnitude_bits(a, ao, n) - magnitude_bits(d, do_, m) <= 2
             return divrem!(q, qo, scratch, 0, a, ao, n, d, do_, m, scratch, m)
         end
@@ -687,14 +687,14 @@ end
             # production always supplies the reciprocal (sqrt's ladder); build
             # one here so the engine can be exercised over arbitrary shapes
             invertappr!(scratch, nn + m, dv, dvo, m, scratch, nn + 2m)
-            mu_divappr_core!(q, qo, scratch, 0, nn, dv, dvo, m,
-                             scratch, nn + m, scratch, nn + 2m)
+            div_blocks!(q, qo, scratch, 0, nn, dv, dvo, m,
+                        MuEngine(scratch, nn + m, m), true, scratch, nn + 2m)
             return nothing
         end
         v = invert_pi1(dv[dvo+m], dv[dvo+m-1])
         if m >= DC_DIV_THRESHOLD && nn - m >= DC_DIV_THRESHOLD
-            divappr_dc!(q, qo, scratch, 0, nn, dv, dvo, m, v, DC_DIV_THRESHOLD,
-                        scratch, nn + m)
+            div_blocks!(q, qo, scratch, 0, nn, dv, dvo, m,
+                        DcEngine(v), true, scratch, nn + m)
         else
             divappr_bc!(q, qo, scratch, 0, nn, dv, dvo, m, v)
         end
@@ -719,7 +719,7 @@ end
         err = apprerr(aref, n, dref, m)
         @test 0 <= err <= 32
         maxerr = max(maxerr, err)
-        # mu_divappr_core! over the same shapes: same one-sided contract, tighter
+        # the mu engine over the same shapes: same one-sided contract, tighter
         # bound (its only inexact block undershoots by <= 5, lifted by +5)
         if m >= 3 && n > m
             muerr = apprerr(aref, n, dref, m; mu = true)

@@ -1,8 +1,10 @@
 # Multi-limb division: Knuth Algorithm D quotient/remainder (divrem!) with a
-# small-quotient subtraction fast path, dispatching to a divide-and-conquer
-# basecase (divrem_dc!, GMP mpn_dcpi1 style) above DC_DIV_THRESHOLD. Built on
-# the division kernels (divrem_1!/divrem_2!/divrem_bc!/invert_pi1), the
-# shift/add/sub kernels, and mul!/sqr! from mul.jl.
+# small-quotient subtraction fast path, dispatching above DC_DIV_THRESHOLD to
+# div_blocks! — one quotient-peeling driver parametrized by engine
+# (divide-and-conquer here, Barrett in invert.jl) and by exact-vs-approximate
+# bottom block. Built on the division kernels
+# (divrem_1!/divrem_2!/divrem_bc!/invert_pi1), the shift/add/sub kernels, and
+# mul!/sqr! from mul.jl.
 
 # Quotient/remainder: a (n limbs) ÷ d (m limbs, d[m] ≠ 0), n ≥ m ≥ 1.
 # For m ≥ 3, a[n] must be nonzero unless n == m (the small-quotient fast
@@ -42,20 +44,34 @@ function divrem!(q::Memory{Limb}, qo::Int, r::Memory{Limb}, ro::Int,
         n > m && (@inbounds q[qo+2] = zero(Limb))
         return nothing
     end
-    # Barrett tier (mu_divrem!, defined in invert.jl — included after this file,
-    # which Julia resolves at call time). Taken only when we own the scratch:
-    # a caller-supplied buffer is sized for the dc path and mu_divrem! needs a
-    # larger one, so the one scratch-passing caller (sqrt.jl:105) stays on dc
-    # regardless of shape.
-    if scratch === nothing && mu_div_worthwhile(n - m + 1, m)
-        return mu_divrem!(q, qo, r, ro, a, ao, n, d, do_, m)
-    end
-    l = leading_zeros(@inbounds d[do_+m])
+    # Barrett tier (mu_div_worthwhile, defined in invert.jl — included after
+    # this file, which Julia resolves at call time). Taken only when we own the
+    # scratch: a caller-supplied buffer is sized for the dc path and the mu
+    # tier needs a larger one, so the one scratch-passing caller (sqrt.jl)
+    # stays on dc regardless of shape.
+    mu = scratch === nothing && mu_div_worthwhile(n - m + 1, m)
+    return div_entry!(q, qo, r, ro, a, ao, n, d, do_, m, mu, scratch, sco)
+end
+
+# Shared entry skeleton for the dc and mu tiers (divrem! above and invert.jl's
+# mu_divrem!): shift-normalize the operands into scratch, build the tier's
+# reciprocal, run the block driver, shift the remainder back out. The appended
+# top limb makes Q < β^(nn-m), which the mu engine's leading block relies on
+# and pins the dc engine's qh to zero.
+#
+# Scratch layout: the nn-limb shifted numerator, the m-limb shifted divisor,
+# then dc: the m-limb block scratch (nn + 2m total); mu: the m-limb reciprocal
+# followed by the larger of invertappr!'s and the block's scratch
+# (mu_divrem_scratch_len(n, m) total).
+function div_entry!(q::Memory{Limb}, qo::Int, r::Memory{Limb}, ro::Int,
+                    a::Memory{Limb}, ao::Int, n::Int, d::Memory{Limb}, do_::Int, m::Int,
+                    mu::Bool, scratch::Union{Memory{Limb},Nothing}=nothing, sco::Int=0)
     nn = n + 1
     if scratch === nothing
-        scratch = Memory{Limb}(undef, nn + 2m)
+        scratch = Memory{Limb}(undef, mu ? mu_divrem_scratch_len(n, m) : nn + 2m)
         sco = 0
     end
+    l = leading_zeros(@inbounds d[do_+m])
     if l == 0
         copyto!(scratch, sco + 1, a, ao + 1, n)
         @inbounds scratch[sco+nn] = zero(Limb)
@@ -65,13 +81,23 @@ function divrem!(q::Memory{Limb}, qo::Int, r::Memory{Limb}, ro::Int,
         lshift!(scratch, sco + nn, d, do_, m, l)
         dv, dvo = scratch, sco + nn
     end
-    v = @inbounds invert_pi1(dv[dvo+m], dv[dvo+m-1])
-    # qh == 0 either way: Q < β^(nn-m)
-    if m >= DC_DIV_THRESHOLD && nn - m >= DC_DIV_PARTIAL_THRESHOLD
-        divrem_dc!(q, qo, scratch, sco, nn, dv, dvo, m, v, DC_DIV_THRESHOLD,
-                   scratch, sco + nn + m)
+    if mu
+        # The top ii limbs of dv are normalized too (same top limb), so
+        # invertappr!'s precondition carries over unchanged.
+        ivo = sco + nn + m
+        wso = sco + nn + 2m
+        ii = mu_inv_size(n - m + 1, m)
+        invertappr!(scratch, ivo, dv, dvo + (m - ii), ii, scratch, wso)
+        div_blocks!(q, qo, scratch, sco, nn, dv, dvo, m,
+                    MuEngine(scratch, ivo, ii), false, scratch, wso)
     else
-        divrem_bc!(q, qo, scratch, sco, nn, dv, dvo, m, v)
+        v = @inbounds invert_pi1(dv[dvo+m], dv[dvo+m-1])
+        if m >= DC_DIV_THRESHOLD && nn - m >= DC_DIV_PARTIAL_THRESHOLD
+            div_blocks!(q, qo, scratch, sco, nn, dv, dvo, m,
+                        DcEngine(v), false, scratch, sco + nn + m)
+        else
+            divrem_bc!(q, qo, scratch, sco, nn, dv, dvo, m, v)
+        end
     end
     if l == 0
         copyto!(r, ro + 1, scratch, sco + 1, m)
@@ -80,6 +106,35 @@ function divrem!(q::Memory{Limb}, qo::Int, r::Memory{Limb}, ro::Int,
     end
     return nothing
 end
+
+# ---- engines ------------------------------------------------------------
+# div_blocks! (end of file) peels the quotient into blocks; an engine carries
+# one tier's reciprocal state and implements div_block! (one exact block) and
+# divappr_block! (approximate bottom block) plus block_scratch_len, the
+# scratch limbs one block needs. The dc methods live below; the mu methods sit
+# in invert.jl with the reciprocal machinery (included after this file, which
+# Julia resolves at call time).
+
+# dc engine: v = invert_pi1 of the normalized divisor's top two limbs, thr the
+# recursion cutoff (clamped >= 4 so divrem_dc_n!'s halves keep divrem_bc! at
+# m >= 2; non-default only in tests/bench forcing deep recursion).
+struct DcEngine
+    v::Limb
+    thr::Int
+    DcEngine(v::Limb, thr::Int=DC_DIV_THRESHOLD) = new(v, max(thr, 4))
+end
+block_scratch_len(::DcEngine, m::Int) = m
+
+# Barrett engine: the approximate reciprocal of the divisor's top ii limbs at
+# iv[ivo+1..ivo+ii] (ii = m unless the quotient is short — see mu_inv_size).
+# divappr_block! requires ii == m: its +5 lift relies on the full-width
+# estimate's undershoot bound.
+struct MuEngine
+    iv::Memory{Limb}
+    ivo::Int
+    ii::Int
+end
+block_scratch_len(::MuEngine, m::Int) = mu_block_scratch_len(m)
 
 # Schoolbook → divide-and-conquer division crossover, in limbs (GMP's
 # DC_DIV_QR_THRESHOLD analogue; tuned by bench/bench_dc_thr.jl). It gates the
@@ -161,19 +216,20 @@ end
 # Must stay >= 4 so divrem_dc_n!'s halves keep divrem_bc! at m >= 2.
 const DC_DIV_PARTIAL_THRESHOLD = 48
 
-# Leading partial quotient block: u[uo+1..uo+m+s] ÷ d (full m limbs), s <= m.
-# Writes q[qo+1..qo+s], leaves the m-limb remainder in u[uo+1..uo+m], returns
-# qh. s == m is the balanced step; very small s stays schoolbook (O(s·m),
-# one-off); otherwise divide the top 2s limbs by the top s limbs of d, then
-# subtract the cross product q·d_lo with the same add-back repair (GMP
-# mpn_dcpi1_div_qr's qn < dn arm).
-function divrem_dc_partial!(q::Memory{Limb}, qo::Int, u::Memory{Limb}, uo::Int,
-                            d::Memory{Limb}, do_::Int, m::Int, s::Int, v::Limb,
-                            scratch::Memory{Limb}, so::Int, thr::Int)
-    s == m && return divrem_dc_n!(q, qo, u, uo, d, do_, m, v, scratch, so, thr)
-    s < min(thr, DC_DIV_PARTIAL_THRESHOLD) &&
-        return divrem_bc!(q, qo, u, uo, m + s, d, do_, m, v)
-    qh = divrem_dc_n!(q, qo, u, uo + (m - s), d, do_ + (m - s), s, v, scratch, so, thr)
+# One exact block: s quotient limbs (s <= m) for the m+s-limb window
+# u[uo+1..uo+m+s], remainder left in u[uo+1..uo+m], returns qh, the extra top
+# quotient bit. This dc method is GMP mpn_dcpi1_div_qr's qn < dn arm: s == m
+# is the balanced step; very small s stays schoolbook (O(s·m), one-off);
+# otherwise divide the top 2s limbs by the top s limbs of d, then subtract the
+# cross product q·d_lo with the same add-back repair as divrem_dc_n!.
+function div_block!(e::DcEngine, q::Memory{Limb}, qo::Int, u::Memory{Limb}, uo::Int,
+                    d::Memory{Limb}, do_::Int, m::Int, s::Int,
+                    scratch::Memory{Limb}, so::Int)
+    s == m && return divrem_dc_n!(q, qo, u, uo, d, do_, m, e.v, scratch, so, e.thr)
+    s < min(e.thr, DC_DIV_PARTIAL_THRESHOLD) &&
+        return divrem_bc!(q, qo, u, uo, m + s, d, do_, m, e.v)
+    qh = divrem_dc_n!(q, qo, u, uo + (m - s), d, do_ + (m - s), s, e.v,
+                      scratch, so, e.thr)
     if s >= m - s                                          # q × d_lo, m limbs
         mul!(scratch, so, q, qo, s, d, do_, m - s)
     else
@@ -190,36 +246,13 @@ function divrem_dc_partial!(q::Memory{Limb}, qo::Int, u::Memory{Limb}, uo::Int,
     return qh
 end
 
-# Divide-and-conquer quotient/remainder with divrem_bc!'s exact contract:
-# u (nn limbs, destroyed; remainder left in u[uo+1..uo+m]) ÷ normalized
-# m-limb d with v = invert_pi1 of its top two limbs; writes q[1..nn-m],
-# returns the extra top quotient bit qh. Requires nn > m. The quotient is
-# peeled from the top: a leading partial block of s limbs (qn reduced mod m
-# into [1, m]), then full balanced 2m/m blocks — each later window tops out
-# with the previous remainder (< d), so only the leading block can set qh.
-function divrem_dc!(q::Memory{Limb}, qo::Int, u::Memory{Limb}, uo::Int, nn::Int,
-                    d::Memory{Limb}, do_::Int, m::Int, v::Limb,
-                    thr::Int=DC_DIV_THRESHOLD,
-                    scratch::Memory{Limb}=Memory{Limb}(undef, m), so::Int=0)
-    qn = nn - m
-    thr = max(thr, 4)
-    s = qn <= m ? qn : qn - m * ((qn - 1) ÷ m)
-    off = qn - s
-    qh = divrem_dc_partial!(q, qo + off, u, uo + off, d, do_, m, s, v, scratch, so, thr)
-    while off > 0
-        off -= m
-        divrem_dc_n!(q, qo + off, u, uo + off, d, do_, m, v, scratch, so, thr)
-    end
-    return qh
-end
-
 # Schoolbook → divide-and-conquer crossover for the *approximate* engines. It is
 # far higher than DC_DIV_THRESHOLD because divappr_bc! truncates every row's
 # submul to the triangle (kernels/div.jl:345), a constant-factor saving that
-# divappr_dc! largely forfeits — all its blocks above the bottom-most run the
-# exact divrem_dc_partial!, remainder work included.
+# the approximate dc path largely forfeits — all its blocks above the
+# bottom-most run the exact div_block!, remainder work included.
 #
-# divappr_bc!/divappr_dc! on balanced nn = 2m+1, by divisor limbs m:
+# divappr_bc! vs the dc driver on balanced nn = 2m+1, by divisor limbs m:
 #
 #   m      100   128   192   256   384   512   640   768   896
 #   ratio  0.87  0.81  0.90  0.91  1.02  1.09  1.31  1.47  1.50
@@ -238,69 +271,81 @@ end
 # here (as sqrt did before this constant existed) gave up that whole band.
 const DIVAPPR_DC_THRESHOLD = 320
 
-# Approximate leading quotient block, no remainder: writes s quotient limbs q̂
-# for the top m+s live limbs of u by the m-limb normalized d, one-sided with
-# q_true ≤ q̂ ≤ q_true + E; u above uo is destroyed and holds nothing
-# meaningful. Returns the extra top quotient bit/carry (the over-approximation
-# of a maximal true quotient can carry out; callers fold it).
-#
-# E ≤ ~20 for any feasible size: entry and per-level divisor truncation
-# contribute ≤ 1 each (numerator ≤ β^qn·d against a kept top ≥ β^(t-1),
-# t = qn+2), the triangle basecase ≤ 2, and the dc recursion halves the block
-# per level. sqrt_root_cert allows 32, so it has slack.
+# Bottom approximate block: s one-sided quotient limbs (q_true ≤ q̂ ≤
+# q_true + E) for the top m+s live limbs of u, no remainder — u above uo is
+# destroyed and holds nothing meaningful. Returns the over-approximation's
+# carry out of the s limbs (a maximal true quotient can carry; callers fold
+# it). For this dc method E ≤ ~20 for any feasible size: entry and per-level
+# divisor truncation contribute ≤ 1 each (numerator ≤ β^qn·d against a kept
+# top ≥ β^(t-1), t = qn+2), the triangle basecase ≤ 2, and the dc recursion
+# halves the block per level. sqrt_root_cert allows 32, so it has slack.
 #
 # Structure: truncate the divisor to its top s+2 limbs — only those can move
-# the quotient by more than 1 ulp, since the dropped tail is < β^(m-s-2) against
-# a divisor ≥ β^(m-1) — then peel the top ⌈s/2⌉ quotient limbs exactly with
-# divrem_dc_partial! (their remainder feeds the rest; approximating them would
-# scale the error by β^s2), and recurse on the bottom half — the recursion is
-# where the remainder work is saved.
-function divappr_dc_partial!(q::Memory{Limb}, qo::Int, u::Memory{Limb}, uo::Int,
-                             d::Memory{Limb}, do_::Int, m::Int, s::Int, v::Limb,
-                             scratch::Memory{Limb}, so::Int, thr::Int)
+# the quotient by more than 1 ulp, since the dropped tail is < β^(m-s-2)
+# against a divisor ≥ β^(m-1) — then peel the top ⌈s/2⌉ quotient limbs exactly
+# (their remainder feeds the rest; approximating them would scale the error by
+# β^s2), and recurse on the bottom half — the recursion is where the remainder
+# work is saved.
+function divappr_block!(e::DcEngine, q::Memory{Limb}, qo::Int, u::Memory{Limb}, uo::Int,
+                        d::Memory{Limb}, do_::Int, m::Int, s::Int,
+                        scratch::Memory{Limb}, so::Int)
     if m > s + 2
         drop = m - (s + 2)
-        return divappr_dc_partial!(q, qo, u, uo + drop, d, do_ + drop, s + 2, s,
-                                   v, scratch, so, thr)
+        return divappr_block!(e, q, qo, u, uo + drop, d, do_ + drop, s + 2, s,
+                              scratch, so)
     end
-    s < thr && return divappr_bc!(q, qo, u, uo, m + s, d, do_, m, v)
+    s < e.thr && return divappr_bc!(q, qo, u, uo, m + s, d, do_, m, e.v)
     s2 = s >> 1
-    qh = divrem_dc_partial!(q, qo + s2, u, uo + s2, d, do_, m, s - s2, v,
-                            scratch, so, thr)
-    c = divappr_dc_partial!(q, qo, u, uo, d, do_, m, s2, v, scratch, so, thr)
+    qh = div_block!(e, q, qo + s2, u, uo + s2, d, do_, m, s - s2, scratch, so)
+    c = divappr_block!(e, q, qo, u, uo, d, do_, m, s2, scratch, so)
     if c != zero(Limb)   # rare: the lo block's over-approximation carried out
         qh += add_1!(q, qo + s2, q, qo + s2, s - s2, c)
     end
     return qh
 end
 
-# Approximate quotient with divrem_dc!'s peeling and contract, minus the
-# remainder: all quotient blocks above the bottom-most are computed exactly
-# (their remainders feed lower blocks), only the bottom block runs the
-# approximate recursion. u is destroyed, holds no remainder.
-function divappr_dc!(q::Memory{Limb}, qo::Int, u::Memory{Limb}, uo::Int, nn::Int,
-                     d::Memory{Limb}, do_::Int, m::Int, v::Limb,
-                     thr::Int=DC_DIV_THRESHOLD,
-                     scratch::Memory{Limb}=Memory{Limb}(undef, m), so::Int=0)
-    qn = nn - m
-    thr = max(thr, 4)
-    qn <= m && return divappr_dc_partial!(q, qo, u, uo, d, do_, m, qn, v, scratch, so, thr)
-    s = qn - m * ((qn - 1) ÷ m)
-    off = qn - s
-    qh = divrem_dc_partial!(q, qo + off, u, uo + off, d, do_, m, s, v, scratch, so, thr)
-    while off > m
-        off -= m
-        divrem_dc_n!(q, qo + off, u, uo + off, d, do_, m, v, scratch, so, thr)
+# Blocked quotient(/remainder) driver: u (nn limbs, destroyed) ÷ normalized
+# m-limb d, writing q[qo+1..qo+nn-m]; requires nn > m. Peels the quotient from
+# the top: a leading partial block of s limbs (qn reduced mod m into [1, m]),
+# then full balanced m-limb blocks — each later window tops out with the
+# previous block's remainder (< d), so only the leading block can set the
+# returned qh, and every window inherits the mu engine's U < d·β^s
+# precondition from the caller's Q < β^(nn-m) appended-limb headroom.
+#
+# Exact (approx = false): the m-limb remainder is left in u[uo+1..uo+m].
+# Approximate: no remainder; only the bottom block is approximate — everything
+# above it runs exactly, feeding remainders downward — with its carry folded
+# into the limbs above, so the whole quotient is one-sided with the bottom
+# block's E (see the divappr_block! methods). scratch needs
+# block_scratch_len(eng, m) limbs at so (allocated when not passed).
+function div_blocks!(q::Memory{Limb}, qo::Int, u::Memory{Limb}, uo::Int, nn::Int,
+                     d::Memory{Limb}, do_::Int, m::Int, eng, approx::Bool,
+                     scratch::Union{Memory{Limb},Nothing}=nothing, so::Int=0)
+    if scratch === nothing
+        scratch = Memory{Limb}(undef, block_scratch_len(eng, m))
+        so = 0
     end
-    c = divappr_dc_partial!(q, qo, u, uo, d, do_, m, m, v, scratch, so, thr)
-    if c != zero(Limb)
-        qh += add_1!(q, qo + m, q, qo + m, qn - m, c)
+    qn = nn - m
+    s = qn <= m ? qn : qn - m * ((qn - 1) ÷ m)
+    if approx && qn <= m
+        return divappr_block!(eng, q, qo, u, uo, d, do_, m, s, scratch, so)
+    end
+    off = qn - s
+    qh = div_block!(eng, q, qo + off, u, uo + off, d, do_, m, s, scratch, so)
+    bottom = approx ? m : 0
+    while off > bottom
+        off -= m
+        div_block!(eng, q, qo + off, u, uo + off, d, do_, m, m, scratch, so)
+    end
+    if approx
+        c = divappr_block!(eng, q, qo, u, uo, d, do_, m, m, scratch, so)
+        if c != zero(Limb)
+            qh += add_1!(q, qo + m, q, qo + m, qn - m, c)
+        end
     end
     return qh
 end
 
-# These engines have no divrem!-style entry wrapper: their only consumer is
-# sqrt.jl, which drives them directly off its own normalized numerator buffer,
-# supplying the appended zero limb that keeps the over-approximated quotient
-# inside nn-m limbs. test_algorithms.jl carries an equivalent driver so they
-# keep direct coverage over arbitrary shapes.
+# The approx side has no divrem!-style entry wrapper: its only consumer is
+# sqrt.jl, which drives div_blocks! directly off its own normalized numerator
+# buffer; test_algorithms.jl carries an equivalent driver for direct coverage.

@@ -11,7 +11,7 @@
 #   sqr      sqr! vs __gmpn_sqr, plus basecase/kar and kar/NTT crossovers
 #   div      divrem! / divrem_1! vs __gmpn_tdiv_qr / __gmpn_divrem_1
 #   kar      KARATSUBA_THRESHOLD sweep (mul_kar! vs gmp)
-#   dc       DC_DIV_THRESHOLD sweep (divrem_dc!/bc! vs gmp)
+#   dc       DC_DIV_THRESHOLD sweep (div_blocks! dc / divrem_bc! vs gmp)
 #   gcd      subquadratic gcd/gcdx threshold sweep (Lehmer vs DC vs gmp)
 #   barrett  BARRETT_THRESHOLD / BARRETT_EVEN_THRESHOLD sweep (powermod_limbs)
 #   sqrt     SQRT_DIVAPPR_THRESHOLD sweep (isqrt divappr vs exact vs gmp)
@@ -28,7 +28,7 @@ using NativeBigInt: Limb,
     add_n!, sub_n!, mul_1!, addmul_1!, addmul_2!, submul_1!, mul_basecase!,
     lshift!, rshift!, mul!, sqr!, mul_kar!, sqr_basecase!, sqr_kar!,
     sqr_fpntt2!, kar_scratch_len, sqr_scratch_len, MUL_FPNTT_THRESHOLD,
-    divrem!, divrem_1!, divrem_dc!, divrem_bc!, invert_pi1, gcd!, gcdext!,
+    divrem!, divrem_1!, div_blocks!, DcEngine, divrem_bc!, invert_pi1, gcd!, gcdext!,
     powermod_limbs, invertappr!, invertappr_scratch_len,
     mu_divrem!, mu_divrem_scratch_len,
     fp_ntt_plan, fp_ntt_fwd!, fp_ntt_rev!, FP_CTX1, fp_prime, two_adicity
@@ -174,10 +174,10 @@ run_dc(sizes) = sweep(sizes, m -> begin
     nn = 2m; d = rlimbs(m); d[m] |= Limb(1) << 63             # normalized divisor
     u = rlimbs(nn); v = invert_pi1(d[m], d[m-1])
     q = Memory{Limb}(undef, nn - m + 1); r = Memory{Limb}(undef, m)
-    # divrem_dc!/bc! destroy the numerator, so each sample re-copies it
+    # div_blocks!/divrem_bc! destroy the numerator, so each sample re-copies it
     vcat(["gmp" => (() -> @belapsed g_tdiv!($q, $r, $u, $nn, $d, $m)),
           "bc" => (() -> @belapsed divrem_bc!($q, 0, uu, 0, $nn, $d, 0, $m, $v) setup = (uu = copy($u)) evals = 1)],
-         ["T=$t" => (() -> @belapsed divrem_dc!($q, 0, uu, 0, $nn, $d, 0, $m, $v, $t) setup = (uu = copy($u)) evals = 1) for t in thrs])
+         ["T=$t" => (() -> @belapsed div_blocks!($q, 0, uu, 0, $nn, $d, 0, $m, DcEngine($v, $t), false) setup = (uu = copy($u)) evals = 1) for t in thrs])
 end; unit = 1e6, u = "us")
 
 function run_gcd(sizes)
