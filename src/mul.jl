@@ -38,22 +38,29 @@ const SQR_FPNTT_THRESHOLD = 160  # operand at least this many limbs
 # Unwinding: K ≥ 6 ⟺ d ≥ 6^(2^56) ⟺ b ≥ 6^(2^131), i.e. n ≥ 2^(6^(2^131))
 # bits.  Neither b nor log2 b fits a machine word (log2 b ≥ 2^131·log2 6),
 # so the constant is kept on the log2∘log6 scale, where the cutoff is the
-# integer 131 exactly:  dispatch when  log2(log6(b)) ≥ 131.  For any
-# representable operand b ≤ 2^63 and log2(log6 b) < 5, so the branch is
-# never taken, as the paper's own cutoff analysis implies.  (The weaker
-# hypothesis d ≥ 2 would already need n ≥ 2^(2^(2^75)) bits.)
+# integer 131 exactly:  dispatch when  ⌊log2 ⌊log6 b⌋⌋ ≥ 131,  which is
+# equivalent to b ≥ 6^(2^131) because 2^131 is a power of two.  The
+# predicate is exact integer arithmetic over any Integer limb count, so it
+# is right for BigInt sizes too, not just for the Int the Memory API hands
+# mul!; with an Int operand b ≤ 69 and ⌊log2 ⌊log6 b⌋⌋ ≤ 1, so there the
+# branch is never taken, as the paper's own cutoff analysis implies.  (The
+# weaker hypothesis d ≥ 2 would already need n ≥ 2^(2^(2^75)) bits.)
 # BelowNLogN.mul_belownlogn runs the same algorithm at any size (it
 # re-derives p from the paper's error bound instead of assuming n is
 # large); it is benchmark-tuned in the sense that bench/bench_belownlogn.jl
 # measured it, not in the sense that it won.
-const MUL_BELOWNLOGN_THRESHOLD = 131   # on the scale log2(log6(⌈log2 bits⌉))
+const MUL_BELOWNLOGN_THRESHOLD = 131   # on the scale ⌊log2 ⌊log6 ⌈log2 bits⌉⌋⌋
 
 # b = ⌈log2(bits)⌉ for an m-limb top-normalized operand, taking bits = 64m
 # as the paper's machine reads the whole input string; m ≥ 1.
-@inline belownlogn_b(m::Int) = 6 + Base.top_set_bit(m - 1)
-# The paper's cutoff predicate: K = ⌊d^c⌋ ≥ 6 for inputs of 64m bits.
-@inline above_belownlogn_cutoff(m::Int) =
-    log2(log(6.0, Float64(belownlogn_b(m)))) >= MUL_BELOWNLOGN_THRESHOLD
+@inline belownlogn_b(m::Integer) = 6 + Base.top_set_bit(m - 1)
+# Exact ⌊log2 ⌊log6 b⌋⌋ for b ≥ 6 (ndigits is mpz_sizeinbase for BigInt).
+@inline belownlogn_loglog(b::Integer) = Base.top_set_bit(ndigits(b, base=6) - 1) - 1
+# The paper's cutoff predicate, K = ⌊d^c⌋ ≥ 6, for inputs of 64m bits.
+# `threshold` is exposed so the firing boundary can be tested at a
+# representable size (threshold k fires exactly at b ≥ 6^(2^k)).
+@inline above_belownlogn_cutoff(m::Integer; threshold::Int=MUL_BELOWNLOGN_THRESHOLD) =
+    belownlogn_loglog(belownlogn_b(m)) >= threshold
 
 # Value comparison of la-limb a vs lb-limb b (la >= lb): strip a's zero top
 # limbs (split halves are zero-padded, cmp_limbs trusts lengths) and delegate.

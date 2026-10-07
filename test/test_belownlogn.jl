@@ -385,24 +385,39 @@ end
 end
 
 @testset "dispatch at the paper's cutoff" begin
-    using NativeBigInt: belownlogn_b, above_belownlogn_cutoff, MUL_BELOWNLOGN_THRESHOLD
-    # b = ⌈log2(64m)⌉ for the m-limb input string
+    using NativeBigInt: belownlogn_b, belownlogn_loglog, above_belownlogn_cutoff,
+                        MUL_BELOWNLOGN_THRESHOLD
+    # b = ⌈log2(64m)⌉ for the m-limb input string, any Integer m
     @test belownlogn_b(1) == 6
     @test belownlogn_b(2) == 7
     @test belownlogn_b(3) == 8
     @test belownlogn_b(2^20) == 26
     @test belownlogn_b(2^20 + 1) == 27
-    # the constant is the cutoff on the log2∘log6 scale: b = 6^(2^k) maps to k
-    setprecision(BigFloat, 256) do
-        for k in (0, 1, 2, 5, 10, 20, 40)
-            b = BigFloat(6)^(BigFloat(2)^k)
-            @test log2(log(big(6), b)) ≈ k atol = 1e-60
-        end
+    @test belownlogn_b(big(2)^1000) == 1006
+    @test belownlogn_b(big(2)^1000 + 1) == 1007
+    # exact ⌊log2 ⌊log6 b⌋⌋: steps up precisely at b = 6^(2^k)
+    for k in (0, 1, 2, 5, 10, 16)
+        b = big(6)^(big(2)^k)
+        @test belownlogn_loglog(b) == k
+        @test belownlogn_loglog(b - 1) == k - 1
+        @test belownlogn_loglog(b + 1) == k
+        @test belownlogn_loglog(2b) == k
     end
+    @test belownlogn_loglog(6) == 0
+    @test belownlogn_loglog(69) == 1
     @test MUL_BELOWNLOGN_THRESHOLD == 131    # K = ⌊d^c⌋ ≥ 6 ⟺ b ≥ 6^(2^131)
-    # no representable operand reaches it (b ≤ 69 gives log2(log6 b) < 5)
+    # the predicate fires exactly at b = 6^(2^k): with k = 3 that is
+    # b = ⌈log2(64m)⌉ ≥ 6^8, i.e. m ≥ 2^(6^8-7) + 1 limbs, a BigInt size
+    m3 = big(2)^(6^8 - 7) + 1
+    @test above_belownlogn_cutoff(m3; threshold=3)
+    @test !above_belownlogn_cutoff(m3 - 1; threshold=3)
+    @test above_belownlogn_cutoff(m3 + 1; threshold=3)
+    @test above_belownlogn_cutoff(2m3; threshold=3)
+    @test !above_belownlogn_cutoff(2m3; threshold=4)   # 6^16 bits of limb count won't fit in RAM
+    # no Int-sized operand reaches the real cutoff (b ≤ 69 gives ≤ 1)
     for m in (1, 2, 3, 64, 2^20, 2^40, 2^57, typemax(Int) >> 1, typemax(Int))
         @test !above_belownlogn_cutoff(m)
-        @test log2(log(6.0, Float64(belownlogn_b(m)))) < 5
+        @test belownlogn_loglog(belownlogn_b(m)) <= 1
     end
+    @test !above_belownlogn_cutoff(big(2)^100000)
 end

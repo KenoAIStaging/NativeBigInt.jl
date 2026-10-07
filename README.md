@@ -69,7 +69,8 @@ Dispatch thresholds are benchmark-tuned (`bench/bench_kernels.jl`).
   input length (p is re-derived from the paper's error chain at finite n).
   `mul!` dispatches to it at the paper's actual cutoff, n ≥ 2^(6^(2^131))
   bits (from its hypothesis K = ⌊d^c⌋ ≥ 6): `MUL_BELOWNLOGN_THRESHOLD` is
-  131 on the scale log₂(log₆ ⌈log₂ n⌉), the only one that fits an `Int`.
+  131 on the scale ⌊log₂⌊log₆⌈log₂ n⌉⌋⌋, the only one that fits an `Int`,
+  and the predicate is exact integer arithmetic over any `Integer` size.
   See "Multiplication below n log n" below.
 
 - **Division (`src/div.jl`):** multi-limb `divrem!` — Knuth Algorithm D over
