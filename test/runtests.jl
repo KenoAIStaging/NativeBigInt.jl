@@ -8,4 +8,5 @@ using NativeBigInt, Test, Random
     include("test_fpntt.jl")
     include("test_mixed.jl")
     include("test_rand.jl")
+    include("test_belownlogn.jl")
 end

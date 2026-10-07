@@ -30,6 +30,17 @@ const SQR_KARATSUBA_THRESHOLD = 52
 const MUL_FPNTT_MIN = 64         # smaller operand at least this many limbs
 const MUL_FPNTT_THRESHOLD = 124  # average operand at least this many limbs
 const SQR_FPNTT_THRESHOLD = 160  # operand at least this many limbs
+# fp NTT → O(n (log n)^(1-2^-182)) multiplication (src/belownlogn/).  The
+# paper proves its bound for all n beyond one fixed cutoff and uses the
+# established multiplier below it.  Its most concrete size hypothesis is the
+# chunk width K = ⌊d^c⌋ ≥ 6 with c = 2^-56 and d = ⌊⌈log2 n⌉^ε⌋, ε = 2^-75,
+# i.e. n ≥ 2^(6^(2^131)) bits; even the weaker d ≥ 2 needs n ≥ 2^(2^(2^75)).
+# No machine word holds either, so the threshold is the largest representable
+# limb count and the branch is unreachable.  BelowNLogN.mul_belownlogn runs
+# the same algorithm at any size (it re-derives p from the paper's error
+# bound instead of assuming n is large); it is benchmark-tuned in the sense
+# that bench/bench_belownlogn.jl measured it, not in the sense that it won.
+const MUL_BELOWNLOGN_THRESHOLD = typemax(Int)
 
 # Value comparison of la-limb a vs lb-limb b (la >= lb): strip a's zero top
 # limbs (split halves are zero-padded, cmp_limbs trusts lengths) and delegate.
@@ -176,6 +187,9 @@ function mul!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, m::Int,
               b::Memory{Limb}, bo::Int, n::Int)
     if n < MUL_KARATSUBA_THRESHOLD
         return mul_basecase!(r, ro, a, ao, m, b, bo, n)
+    end
+    if n >= MUL_BELOWNLOGN_THRESHOLD
+        return BelowNLogN.mul_limbs!(r, ro, a, ao, m, b, bo, n)
     end
     if n >= MUL_FPNTT_MIN && m + n >= 2MUL_FPNTT_THRESHOLD
         return mul_fpntt2!(r, ro, a, ao, m, b, bo, n)

@@ -52,6 +52,16 @@ cover:
   and the single-prime fp pipeline were removed once the two-prime fp NTT
   beat them everywhere — git history has them; don't reintroduce variants
   without benchmark cause.
+- **`src/belownlogn/`** is the preprint algorithm "Integer multiplication
+  below n log n" (OpenAI, 2026-09-23), implemented faithfully in the RAM
+  model and exact at every size; its `mul!` dispatch threshold is
+  `typemax(Int)` on purpose (the paper's cutoff is ≥ 2^(6^(2^131)) bits) and
+  it is 10⁴–10⁵× slower than the fp NTT at every size. It is the one engine
+  here that exists for correctness and faithfulness, not benchmarks; do not
+  "tune" it into something else, and keep its tests (`test_belownlogn.jl`)
+  exact against rational/BigFloat references. Include order inside the
+  submodule is the dependency order: fixedwidth → f2 → motifs → layers →
+  synthetic → resampling → assembly. `bench/bench_belownlogn.jl` times it.
 - `ext/NativeBigIntRandomExt.jl` is a weak-dependency extension (loaded when
   `Random` is available) providing `rand` over `NBig` ranges.
 

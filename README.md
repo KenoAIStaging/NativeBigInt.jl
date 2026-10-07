@@ -40,7 +40,7 @@ Dispatch thresholds are benchmark-tuned (`bench/bench_kernels.jl`).
   potential caller sits above the NTT crossover, where a truncated product
   saves nothing, so they were removed (see git history).
 
-- **fp NTT multiplication (`src/fpntt.jl`):** the sole large-size engine —
+- **fp NTT multiplication (`src/fpntt.jl`):** the large-size engine that actually runs —
   number-theoretic transforms computed entirely in `Float64` in the style of
   FLINT's `fft_small`, with the convolution recombined by CRT over two
   just-under-2^50 primes (p₁ = 65205·2^34 + 1, p₂ = 2^50 − 2^38 + 1, both
@@ -57,6 +57,19 @@ Dispatch thresholds are benchmark-tuned (`bench/bench_kernels.jl`).
   radix 3 up to twice) with bench-placed per-multiplier admission floors, so
   zero-padding waste is ≤ ~12.5% at small sizes and ≤ ~7% once transforms go
   DRAM-bound. Squaring runs one forward transform instead of two.
+
+- **Multiplication below n log n (`src/belownlogn/`):** the deterministic
+  O(n (log n)^(1−κ)) algorithm of the OpenAI preprint *Integer multiplication
+  below n log n* (September 23, 2026), κ = 2^−182, implemented in the RAM
+  model: Chinese-remainder axis layout, Gaussian resampling with both
+  permutations retained in the transform, Bluestein chirp, coefficient
+  twist, Nussbaumer synthetic transforms over Z[i][y]/(yʳ+1) with the
+  paper's simultaneous butterfly layers, signed Kronecker ring products
+  through `mul!`, rounding and radix-2ᵇ carry recovery. Exact for every
+  input length (p is re-derived from the paper's error chain at finite n).
+  `mul!` dispatches to it above `MUL_BELOWNLOGN_THRESHOLD`, which is
+  `typemax(Int)` because the paper's cutoff is at least 2^(6^(2^131)) bits.
+  See "Multiplication below n log n" below.
 
 - **Division (`src/div.jl`):** multi-limb `divrem!` — Knuth Algorithm D over
   `divrem_bc!` below ~100 limbs, GMP-`dcpi1`-style divide-and-conquer
@@ -124,6 +137,60 @@ Dispatch thresholds are benchmark-tuned (`bench/bench_kernels.jl`).
   covering comparison, `+`/`-`/`*`, `divrem`/`div`/`rem`/`mod`/`fld`/`cld`,
   shifts, two's-complement bitwise ops, `^`, base 2–36 string conversion,
   and conversions to/from `Int64`/`UInt64`/`Int128`/`BigInt`/`Float64`.
+
+## Multiplication below n log n
+
+`src/belownlogn/` implements the preprint's construction as written, with the
+tape-only parts (address-chunk interchange by XOR streams, packed selected-bit
+additions) replaced by the array permutations they implement, since on a RAM
+those are free. Everything that is model-independent is there:
+
+- **The finite networks (`motifs.jl`).** Both constructions of Section 3 for
+  any h: the three-stage, eight-row copy/gather/scatter/side-injection
+  schedule over the three-element subsets of [h], the binary subspace labels
+  of the complex network, and the closed-form counts. At the paper's h = 100
+  the complex network has W = 1,873,807,244,643,542,670,000 wires, labels in
+  F₂^1000000, residual rank s = 1,873,807,244,636,671,267,308,000,000 and
+  relative deficit 73/19,906,842,167,500; all four printed constants are
+  reproduced. The scalar exchange lemma and the residual table (nesting,
+  the I·c central returns of loss h, Σ|Δdim| = Wm − 2N + 2L) are checked at
+  h = 3, 4. The smallest h whose deficit is positive at all is 22, with
+  W ≈ 1.1·10¹³ and frames on 2^10648 addresses per role, so the paper's
+  network is never instantiated; it enters as its constants.
+- **The frame engine and simultaneous layer (`layers.jl`).** Role streams,
+  frames C_U = H^⊗m diag(i^wt(P_U x)) H^⊗m, one child C^⊗f per orthonormal
+  residual vector with inverse children as (−i)^f Z C Z, endpoint Z
+  corrections, the guard-width recurrence, one truncation per layer. It is
+  exercised for real on small networks and agrees with explicit frame
+  matrices; with the paper's constants q₀ = ⌈log₂W⌉⌈log_m 2d⌉ = 71 exceeds
+  every layer that fits in memory, so the multiplication takes the
+  individual-kernel path exactly as the paper's cutoff analysis says it must.
+- **Transforms and recovery (`synthetic.jl`, `resampling.jl`,
+  `assembly.jl`).** Verified against exact rational references
+  (transforms, ring products, convolutions) and BigFloat DFTs (resampling
+  identity R F_s = 2^γ B₀ Q F_t A, both signs), and end to end against
+  `BigInt` from 1 bit to 2²⁰ bits with one, two and three axes.
+
+The paper's own parameter formulas apply at every size. They give
+d = ⌊⌈log₂ n⌉^(2^−75)⌋ = 1 axis for every n a computer can hold, so the
+construction degenerates to: resample the digit vector to a power-of-two
+length, chirp it, and perform the one remaining negacyclic convolution as
+four integer products through the established multiplier. Concretely, an
+n-bit product becomes twelve `mul!` calls on integers of about 150n bits,
+plus three Gaussian resamplings, which is where the time goes:
+
+| bits | d | p | T | setup | product | `mul!` | ratio |
+|---|---|---|---|---|---|---|---|
+| 16k | 1 | 117 | 8192 | 1.4 s | 1.4 s | 15 µs | 91,000 |
+| 65k | 1 | 121 | 16384 | 1.5 s | 1.9 s | 54 µs | 34,000 |
+| 262k | 1 | 136 | 65536 | 4.4 s | 4.1 s | 333 µs | 12,000 |
+| 1M | 1 | 142 | 262144 | 18 s | 21 s | 1.5 ms | 13,600 |
+| 65k | 2 | 244 | 16384 | 2.4 s | 5.9 s | 54 µs | 109,000 |
+| 262k | 3 | 393 | 65536 | 1.5 s | 64 s | 287 µs | 224,000 |
+
+The asymptotic saving is a factor (log₂ n)^(2^−182); at n = 2⁶⁴ that is
+1 + 7·10⁻⁵⁵. `bench/bench_belownlogn.jl` reproduces the table.
+`BelowNLogN.mul_belownlogn(x::NBig, y::NBig; d)` runs the algorithm directly.
 
 ## Benchmarks
 

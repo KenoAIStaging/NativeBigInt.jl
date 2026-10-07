@@ -21,5 +21,6 @@ include("algorithms.jl")
 include("gcd.jl")
 include("nbig.jl")
 include("fpntt.jl")
+include("belownlogn/belownlogn.jl")
 
 end
