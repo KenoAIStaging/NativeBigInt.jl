@@ -67,8 +67,9 @@ Dispatch thresholds are benchmark-tuned (`bench/bench_kernels.jl`).
   paper's simultaneous butterfly layers, signed Kronecker ring products
   through `mul!`, rounding and radix-2ᵇ carry recovery. Exact for every
   input length (p is re-derived from the paper's error chain at finite n).
-  `mul!` dispatches to it above `MUL_BELOWNLOGN_THRESHOLD`, which is
-  `typemax(Int)` because the paper's cutoff is at least 2^(6^(2^131)) bits.
+  `mul!` dispatches to it at the paper's actual cutoff, n ≥ 2^(6^(2^131))
+  bits (from its hypothesis K = ⌊d^c⌋ ≥ 6): `MUL_BELOWNLOGN_THRESHOLD` is
+  131 on the scale log₂(log₆ ⌈log₂ n⌉), the only one that fits an `Int`.
   See "Multiplication below n log n" below.
 
 - **Division (`src/div.jl`):** multi-limb `divrem!` — Knuth Algorithm D over

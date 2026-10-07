@@ -32,15 +32,28 @@ const MUL_FPNTT_THRESHOLD = 124  # average operand at least this many limbs
 const SQR_FPNTT_THRESHOLD = 160  # operand at least this many limbs
 # fp NTT → O(n (log n)^(1-2^-182)) multiplication (src/belownlogn/).  The
 # paper proves its bound for all n beyond one fixed cutoff and uses the
-# established multiplier below it.  Its most concrete size hypothesis is the
-# chunk width K = ⌊d^c⌋ ≥ 6 with c = 2^-56 and d = ⌊⌈log2 n⌉^ε⌋, ε = 2^-75,
-# i.e. n ≥ 2^(6^(2^131)) bits; even the weaker d ≥ 2 needs n ≥ 2^(2^(2^75)).
-# No machine word holds either, so the threshold is the largest representable
-# limb count and the branch is unreachable.  BelowNLogN.mul_belownlogn runs
-# the same algorithm at any size (it re-derives p from the paper's error
-# bound instead of assuming n is large); it is benchmark-tuned in the sense
-# that bench/bench_belownlogn.jl measured it, not in the sense that it won.
-const MUL_BELOWNLOGN_THRESHOLD = typemax(Int)
+# established multiplier below it.  Its sharpest size hypothesis is the
+# chunk width K = ⌊d^c⌋ ≥ 6 (Section 5, packed rectangles) with c = 2^-56
+# and d = ⌊b^ε⌋, ε = 2^-75, b = ⌈log2 n⌉ the input length's bit count.
+# Unwinding: K ≥ 6 ⟺ d ≥ 6^(2^56) ⟺ b ≥ 6^(2^131), i.e. n ≥ 2^(6^(2^131))
+# bits.  Neither b nor log2 b fits a machine word (log2 b ≥ 2^131·log2 6),
+# so the constant is kept on the log2∘log6 scale, where the cutoff is the
+# integer 131 exactly:  dispatch when  log2(log6(b)) ≥ 131.  For any
+# representable operand b ≤ 2^63 and log2(log6 b) < 5, so the branch is
+# never taken, as the paper's own cutoff analysis implies.  (The weaker
+# hypothesis d ≥ 2 would already need n ≥ 2^(2^(2^75)) bits.)
+# BelowNLogN.mul_belownlogn runs the same algorithm at any size (it
+# re-derives p from the paper's error bound instead of assuming n is
+# large); it is benchmark-tuned in the sense that bench/bench_belownlogn.jl
+# measured it, not in the sense that it won.
+const MUL_BELOWNLOGN_THRESHOLD = 131   # on the scale log2(log6(⌈log2 bits⌉))
+
+# b = ⌈log2(bits)⌉ for an m-limb top-normalized operand, taking bits = 64m
+# as the paper's machine reads the whole input string; m ≥ 1.
+@inline belownlogn_b(m::Int) = 6 + Base.top_set_bit(m - 1)
+# The paper's cutoff predicate: K = ⌊d^c⌋ ≥ 6 for inputs of 64m bits.
+@inline above_belownlogn_cutoff(m::Int) =
+    log2(log(6.0, Float64(belownlogn_b(m)))) >= MUL_BELOWNLOGN_THRESHOLD
 
 # Value comparison of la-limb a vs lb-limb b (la >= lb): strip a's zero top
 # limbs (split halves are zero-padded, cmp_limbs trusts lengths) and delegate.
@@ -188,7 +201,7 @@ function mul!(r::Memory{Limb}, ro::Int, a::Memory{Limb}, ao::Int, m::Int,
     if n < MUL_KARATSUBA_THRESHOLD
         return mul_basecase!(r, ro, a, ao, m, b, bo, n)
     end
-    if n >= MUL_BELOWNLOGN_THRESHOLD
+    if above_belownlogn_cutoff(m)
         return BelowNLogN.mul_limbs!(r, ro, a, ao, m, b, bo, n)
     end
     if n >= MUL_FPNTT_MIN && m + n >= 2MUL_FPNTT_THRESHOLD
