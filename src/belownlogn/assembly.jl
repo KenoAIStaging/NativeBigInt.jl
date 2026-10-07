@@ -12,12 +12,14 @@
 # transforms ((u * v)/S² → u * v), and 2^(2b+4) undoes the two input scales.
 #
 # Parameters.  The paper fixes b = ⌈log2 n⌉, p = 6b, d = ⌊b^ε⌋ with
-# ε = 2^-75, T ∈ [4n/b, 8n/b), r = 2^⌈log2(T)/d⌉, prime source lengths
+# ε = 1/40 (Colkitt's parameters; the preprint had ε = 2^-75), T ∈ [4n/b,
+# 8n/b), r = 2^⌈log2(T)/d⌉, prime source lengths
 # s_i ∈ ((1-2η) t_i, (1-η) t_i] with η = 1/(4d), α = ⌈(12 d² b)^(1/4)⌉ and
 # γ = 2 d α², and proves every bound for all sufficiently large n.  Here
 # every input length has to work, so:
-#   * d follows the paper's formula (which is 1 for every b < 2^(2^75)) unless
-#     overridden, and is clamped so that every axis has length ≥ 2;
+#   * d follows the paper's formula (which is 1 for every b < 2^40, i.e. for
+#     every n below 2^(2^40) bits) unless overridden, and is clamped so that
+#     every axis has length ≥ 2;
 #   * the prime intervals are widened downward when the paper's interval is
 #     empty at small t, and T is doubled if the product S then fails to cover
 #     the product degree;
@@ -55,6 +57,36 @@ function isprime_small(n::Int)
         i += 2
     end
     return true
+end
+
+# d = ⌊b^(1/40)⌋, found as the paper prescribes: binary search with exact
+# comparisons d^40 ≤ b.  Works for any Integer b ≥ 1 and returns its type.
+function paper_dimension(b::Integer)
+    b >= 1 || throw(ArgumentError("b must be positive"))
+    lo = one(b)
+    hi = one(b) << cld(Base.top_set_bit(b), 40)     # lo^40 ≤ b < hi^40
+    while hi - lo > 1
+        mid = (lo + hi) >> 1
+        if big(mid)^40 <= b
+            lo = mid
+        else
+            hi = mid
+        end
+    end
+    return lo
+end
+
+# Exact test d^num ≥ k^den for integers d ≥ 1, k ≥ 1, num, den ≥ 1: the
+# floor of log_k d decides everything outside a thin band, and the band is
+# settled by exact powers.  This is how fixed rational powers such as
+# K = ⌊d^c⌋ ≥ 6 with c = 9/10^12 are compared without ever forming d^c.
+function pow_ge(d::Integer, num::Integer, k::Integer, den::Integer)
+    d >= 1 && k >= 1 && num >= 1 && den >= 1 || throw(ArgumentError("positive arguments required"))
+    k == 1 && return true
+    e = ndigits(d, base=k) - 1                       # ⌊log_k d⌋, so k^e ≤ d < k^(e+1)
+    num * e >= den && return true                    # d^num ≥ k^(num e) ≥ k^den
+    num * (e + 1) <= den && return false             # d^num < k^(num (e+1)) ≤ k^den
+    return big(d)^num >= big(k)^den
 end
 
 # Distinct odd primes near the axis lengths; returns nothing if some axis has
@@ -107,8 +139,8 @@ function Params(n::Int; d::Union{Nothing,Int}=nothing)
     n >= 1 || throw(ArgumentError("n must be positive"))
     b = lg(n)
     q = cld(n, b)
-    # d = ⌊b^ε⌋ with ε = 2^-75 is 1 for every representable b
-    d_req = d === nothing ? 1 : d
+    # d = ⌊b^ε⌋ with ε = 1/40, which is 1 for every b < 2^40
+    d_req = d === nothing ? Int(paper_dimension(b)) : d
     d_req >= 1 || throw(ArgumentError("d must be positive"))
     T = 1 << ndigits(cld(4n, b) - 1, base=2)      # power of two in [4n/b, 8n/b)
     while true

@@ -1,4 +1,4 @@
-# Local benchmark of the O(n (log n)^(1-2^-182)) multiplier against mul!
+# Local benchmark of the O(n (log n)^(1-2^-78)) multiplier against mul!
 # (fp NTT) and GMP, with the paper's parameter formulas at each size.  Prints
 # a markdown table; the ratio column is BelowNLogN / mul! (lower is better,
 # and it is never lower than about 10^4).
@@ -6,7 +6,7 @@
 #   julia --startup-file=no --project=. bench/bench_belownlogn.jl [bits...]
 #
 # Trailing integer args override the size list.  Pass `d=<k>` to force k
-# axes (the paper's formula gives d = 1 at every size a computer can hold).
+# axes (the paper's formula d = ⌊⌈log2 n⌉^(1/40)⌋ gives 1 below 2^(2^40) bits).
 using NativeBigInt, Random
 using NativeBigInt: Limb, mul!
 const BN = NativeBigInt.BelowNLogN

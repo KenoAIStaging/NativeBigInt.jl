@@ -30,37 +30,37 @@ const SQR_KARATSUBA_THRESHOLD = 52
 const MUL_FPNTT_MIN = 64         # smaller operand at least this many limbs
 const MUL_FPNTT_THRESHOLD = 124  # average operand at least this many limbs
 const SQR_FPNTT_THRESHOLD = 160  # operand at least this many limbs
-# fp NTT → O(n (log n)^(1-2^-182)) multiplication (src/belownlogn/).  The
-# paper proves its bound for all n beyond one fixed cutoff and uses the
-# established multiplier below it.  Its sharpest size hypothesis is the
-# chunk width K = ⌊d^c⌋ ≥ 6 (Section 5, packed rectangles) with c = 2^-56
-# and d = ⌊b^ε⌋, ε = 2^-75, b = ⌈log2 n⌉ the input length's bit count.
-# Unwinding: K ≥ 6 ⟺ d ≥ 6^(2^56) ⟺ b ≥ 6^(2^131), i.e. n ≥ 2^(6^(2^131))
-# bits.  Neither b nor log2 b fits a machine word (log2 b ≥ 2^131·log2 6),
-# so the constant is kept on the log2∘log6 scale, where the cutoff is the
-# integer 131 exactly:  dispatch when  ⌊log2 ⌊log6 b⌋⌋ ≥ 131,  which is
-# equivalent to b ≥ 6^(2^131) because 2^131 is a power of two.  The
-# predicate is exact integer arithmetic over any Integer limb count, so it
-# is right for BigInt sizes too, not just for the Int the Memory API hands
-# mul!; with an Int operand b ≤ 69 and ⌊log2 ⌊log6 b⌋⌋ ≤ 1, so there the
-# branch is never taken, as the paper's own cutoff analysis implies.  (The
-# weaker hypothesis d ≥ 2 would already need n ≥ 2^(2^(2^75)) bits.)
+# fp NTT → O(n (log n)^(1-2^-78)) multiplication (src/belownlogn/): the
+# OpenAI preprint's algorithm with the parameters and h = 46 network of
+# Colkitt's improvement (github.com/CrocSwap/integer-mult-bounds, patch
+# h46-nonadjacent-78; the preprint itself had κ = 2^-182).  The paper proves
+# its bound for all n beyond one fixed cutoff and uses the established
+# multiplier below it.  Its sharpest size hypothesis is the chunk width
+# K = ⌊d^c⌋ ≥ 6 (Section 5, packed rectangles) with c = a/2 = 9/10^12,
+# a = 9/(5·10^11), and d = ⌊b^ε⌋, ε = 1/40, b = ⌈log2 n⌉ the input length's
+# bit count.  So the dispatch rule is exactly the paper's: compute b, then
+# d by binary search on d^40 ≤ b, then test K ≥ 6, i.e. d^9 ≥ 6^(10^12).
+# The threshold constant is on the K scale, where it is the integer 6.
+# Unwound, the cutoff is d ≥ ⌈6^(10^12/9)⌉ =: D (a number of 2.9·10^11
+# digits), b ≥ D^40 (about 1.15·10^13 bits, 1.4 TB) and n ≥ 2^(D^40) bits.
+# Every step is exact integer arithmetic over any Integer limb count; with
+# an Int operand b ≤ 69 and d = 1, K = 1, so there the branch is never
+# taken, as the paper's cutoff analysis implies.  (The preprint's constants
+# gave n ≥ 2^(6^(2^131)); even d ≥ 2 now needs n ≥ 2^(2^40) bits.)
 # BelowNLogN.mul_belownlogn runs the same algorithm at any size (it
 # re-derives p from the paper's error bound instead of assuming n is
 # large); it is benchmark-tuned in the sense that bench/bench_belownlogn.jl
 # measured it, not in the sense that it won.
-const MUL_BELOWNLOGN_THRESHOLD = 131   # on the scale ⌊log2 ⌊log6 ⌈log2 bits⌉⌋⌋
+const MUL_BELOWNLOGN_THRESHOLD = 6   # on the scale K = ⌊d^c⌋ (chunk width)
 
 # b = ⌈log2(bits)⌉ for an m-limb top-normalized operand, taking bits = 64m
 # as the paper's machine reads the whole input string; m ≥ 1.
 @inline belownlogn_b(m::Integer) = 6 + Base.top_set_bit(m - 1)
-# Exact ⌊log2 ⌊log6 b⌋⌋ for b ≥ 6 (ndigits is mpz_sizeinbase for BigInt).
-@inline belownlogn_loglog(b::Integer) = Base.top_set_bit(ndigits(b, base=6) - 1) - 1
-# The paper's cutoff predicate, K = ⌊d^c⌋ ≥ 6, for inputs of 64m bits.
-# `threshold` is exposed so the firing boundary can be tested at a
-# representable size (threshold k fires exactly at b ≥ 6^(2^k)).
+# The paper's cutoff predicate K = ⌊d^c⌋ ≥ threshold for inputs of 64m
+# bits; K ≥ k ⟺ d^(9/10^12) ≥ k ⟺ d^9 ≥ k^(10^12), decided exactly.
+# `threshold` is exposed so the predicate can be seen to fire (k = 1).
 @inline above_belownlogn_cutoff(m::Integer; threshold::Int=MUL_BELOWNLOGN_THRESHOLD) =
-    belownlogn_loglog(belownlogn_b(m)) >= threshold
+    BelowNLogN.pow_ge(BelowNLogN.paper_dimension(belownlogn_b(m)), 9, threshold, 10^12)
 
 # Value comparison of la-limb a vs lb-limb b (la >= lb): strip a's zero top
 # limbs (split halves are zero-padded, cmp_limbs trusts lengths) and delegate.

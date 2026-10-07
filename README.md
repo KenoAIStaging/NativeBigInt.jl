@@ -60,17 +60,18 @@ Dispatch thresholds are benchmark-tuned (`bench/bench_kernels.jl`).
 
 - **Multiplication below n log n (`src/belownlogn/`):** the deterministic
   O(n (log n)^(1−κ)) algorithm of the OpenAI preprint *Integer multiplication
-  below n log n* (September 23, 2026), κ = 2^−182, implemented in the RAM
-  model: Chinese-remainder axis layout, Gaussian resampling with both
+  below n log n* (September 23, 2026) with the parameter and network
+  improvement of Colkitt's *A sharper exponent for integer multiplication*
+  (κ = 2^−78; the preprint had 2^−182), implemented in the RAM model: Chinese-remainder axis layout, Gaussian resampling with both
   permutations retained in the transform, Bluestein chirp, coefficient
   twist, Nussbaumer synthetic transforms over Z[i][y]/(yʳ+1) with the
   paper's simultaneous butterfly layers, signed Kronecker ring products
   through `mul!`, rounding and radix-2ᵇ carry recovery. Exact for every
   input length (p is re-derived from the paper's error chain at finite n).
-  `mul!` dispatches to it at the paper's actual cutoff, n ≥ 2^(6^(2^131))
-  bits (from its hypothesis K = ⌊d^c⌋ ≥ 6): `MUL_BELOWNLOGN_THRESHOLD` is
-  131 on the scale ⌊log₂⌊log₆⌈log₂ n⌉⌋⌋, the only one that fits an `Int`,
-  and the predicate is exact integer arithmetic over any `Integer` size.
+  `mul!` dispatches to it at the paper's actual cutoff, its hypothesis
+  K = ⌊d^c⌋ ≥ 6 on the chunk width, which is n ≥ 2^(D^40) bits with
+  D = ⌈6^(10^12/9)⌉: `MUL_BELOWNLOGN_THRESHOLD` is 6 on the K scale and the
+  predicate is exact integer arithmetic over any `Integer` size.
   See "Multiplication below n log n" below.
 
 - **Division (`src/div.jl`):** multi-limb `divrem!` — Knuth Algorithm D over
@@ -145,16 +146,26 @@ Dispatch thresholds are benchmark-tuned (`bench/bench_kernels.jl`).
 `src/belownlogn/` implements the preprint's construction as written, with the
 tape-only parts (address-chunk interchange by XOR streams, packed selected-bit
 additions) replaced by the array permutations they implement, since on a RAM
-those are free. Everything that is model-independent is there:
+those are free. The parameters are those of Douglas Colkitt's conditional
+improvement [*A sharper exponent for integer multiplication*](https://github.com/CrocSwap/integer-mult-bounds)
+(patch `h46-nonadjacent-78`): the h = 46 network, ε = 1/40,
+a = 9/(5·10¹¹), τ = σ = 1 − a, c = a/2, κ = 2^−78. Its other half, the
+nonadjacent axis routing that cuts the layout cost from d²(1 + ℓ^τ) to
+d(1 + ℓ^τ) full-field interchanges, is purely a tape schedule: here every
+axis is walked by stride, so it costs nothing and nothing needed to change.
+Everything that is model-independent is there:
 
 - **The finite networks (`motifs.jl`).** Both constructions of Section 3 for
   any h: the three-stage, eight-row copy/gather/scatter/side-injection
   schedule over the three-element subsets of [h], the binary subspace labels
-  of the complex network, and the closed-form counts. At the paper's h = 100
-  the complex network has W = 1,873,807,244,643,542,670,000 wires, labels in
-  F₂^1000000, residual rank s = 1,873,807,244,636,671,267,308,000,000 and
-  relative deficit 73/19,906,842,167,500; all four printed constants are
-  reproduced. The scalar exchange lemma and the residual table (nesting,
+  of the complex network, and the closed-form counts. At Colkitt's h = 46
+  the complex network has W = 130,865,855,373,752,400 wires, labels in
+  F₂^97336, residual rank s = 12,737,958,894,652,805,035,200 and relative
+  deficit 7/22,253,827,054; at the preprint's h = 100 it has
+  W = 1,873,807,244,643,542,670,000, s = 1,873,807,244,636,671,267,308,000,000
+  and deficit 73/19,906,842,167,500. All printed constants of both documents
+  (wire counts, residual ranks, deficits and loss ratios of both networks)
+  are reproduced. The scalar exchange lemma and the residual table (nesting,
   the I·c central returns of loss h, Σ|Δdim| = Wm − 2N + 2L) are checked at
   h = 3, 4. The smallest h whose deficit is positive at all is 22, with
   W ≈ 1.1·10¹³ and frames on 2^10648 addresses per role, so the paper's
@@ -164,9 +175,10 @@ those are free. Everything that is model-independent is there:
   residual vector with inverse children as (−i)^f Z C Z, endpoint Z
   corrections, the guard-width recurrence, one truncation per layer. It is
   exercised for real on small networks and agrees with explicit frame
-  matrices; with the paper's constants q₀ = ⌈log₂W⌉⌈log_m 2d⌉ = 71 exceeds
-  every layer that fits in memory, so the multiplication takes the
-  individual-kernel path exactly as the paper's cutoff analysis says it must.
+  matrices; with the h = 46 constants q₀ = ⌈log₂W⌉⌈log_m 2d⌉ = 57 (71 at
+  h = 100) exceeds every layer that fits in memory, so the multiplication
+  takes the individual-kernel path exactly as the paper's cutoff analysis
+  says it must.
 - **Transforms and recovery (`synthetic.jl`, `resampling.jl`,
   `assembly.jl`).** Verified against exact rational references
   (transforms, ring products, convolutions) and BigFloat DFTs (resampling
@@ -174,7 +186,8 @@ those are free. Everything that is model-independent is there:
   `BigInt` from 1 bit to 2²⁰ bits with one, two and three axes.
 
 The paper's own parameter formulas apply at every size. They give
-d = ⌊⌈log₂ n⌉^(2^−75)⌋ = 1 axis for every n a computer can hold, so the
+d = ⌊⌈log₂ n⌉^(1/40)⌋ = 1 axis for every n below 2^(2^40) bits (the
+preprint's ε = 2^−75 needed 2^(2^75)), so the
 construction degenerates to: resample the digit vector to a power-of-two
 length, chirp it, and perform the one remaining negacyclic convolution as
 four integer products through the established multiplier. Concretely, an
@@ -183,15 +196,16 @@ plus three Gaussian resamplings, which is where the time goes:
 
 | bits | d | p | T | setup | product | `mul!` | ratio |
 |---|---|---|---|---|---|---|---|
-| 16k | 1 | 117 | 8192 | 1.4 s | 1.4 s | 15 µs | 91,000 |
-| 65k | 1 | 121 | 16384 | 1.5 s | 1.9 s | 54 µs | 34,000 |
-| 262k | 1 | 136 | 65536 | 4.4 s | 4.1 s | 333 µs | 12,000 |
-| 1M | 1 | 142 | 262144 | 18 s | 21 s | 1.5 ms | 13,600 |
-| 65k | 2 | 244 | 16384 | 2.4 s | 5.9 s | 54 µs | 109,000 |
-| 262k | 3 | 393 | 65536 | 1.5 s | 64 s | 287 µs | 224,000 |
+| 16k | 1 | 117 | 8192 | 1.7 s | 0.27 s | 17 µs | 15,800 |
+| 65k | 1 | 121 | 16384 | 1.5 s | 0.86 s | 48 µs | 17,900 |
+| 262k | 1 | 136 | 65536 | 4.3 s | 3.8 s | 204 µs | 18,500 |
+| 1M | 1 | 142 | 262144 | 19 s | 21 s | 1.1 ms | 18,900 |
+| 65k | 2 | 244 | 16384 | 3.2 s | 4.5 s | 48 µs | 93,000 |
+| 262k | 3 | 393 | 65536 | 3.7 s | 62 s | 203 µs | 304,000 |
 
-The asymptotic saving is a factor (log₂ n)^(2^−182); at n = 2⁶⁴ that is
-1 + 7·10⁻⁵⁵. `bench/bench_belownlogn.jl` reproduces the table.
+The asymptotic saving is a factor (log₂ n)^(2^−78); at n = 2⁶⁴ that is
+1 + 1.4·10⁻²³, up from the preprint's 1 + 7·10⁻⁵⁵.
+`bench/bench_belownlogn.jl` reproduces the table.
 `BelowNLogN.mul_belownlogn(x::NBig, y::NBig; d)` runs the algorithm directly.
 
 ## Benchmarks

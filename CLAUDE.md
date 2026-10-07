@@ -53,10 +53,12 @@ cover:
   beat them everywhere — git history has them; don't reintroduce variants
   without benchmark cause.
 - **`src/belownlogn/`** is the preprint algorithm "Integer multiplication
-  below n log n" (OpenAI, 2026-09-23), implemented faithfully in the RAM
-  model and exact at every size; `mul!` dispatches to it at the paper's
-  real cutoff, n ≥ 2^(6^(2^131)) bits, which `MUL_BELOWNLOGN_THRESHOLD`
-  stores as 131 on the log₂∘log₆ scale of ⌈log₂ n⌉ (nothing representable
+  below n log n" (OpenAI, 2026-09-23) with the parameter and network
+  improvement of Colkitt (CrocSwap/integer-mult-bounds, κ = 2^−78, h = 46),
+  implemented faithfully in the RAM model and exact at every size; `mul!`
+  dispatches to it at the paper's real cutoff, the chunk width
+  K = ⌊d^c⌋ ≥ 6, which `MUL_BELOWNLOGN_THRESHOLD` stores as 6 on the K
+  scale and evaluates with exact integer arithmetic (nothing representable
   reaches it), and it is 10⁴–10⁵× slower than the fp NTT at every size. It is the one engine
   here that exists for correctness and faithfulness, not benchmarks; do not
   "tune" it into something else, and keep its tests (`test_belownlogn.jl`)

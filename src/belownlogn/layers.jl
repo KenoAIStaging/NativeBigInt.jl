@@ -22,10 +22,11 @@
 #     and the role split is a strided copy.
 #
 # The network constants decide when the recursion engages: the layer applies
-# individual kernels when D ≤ q_0 = ⌈log_2 W⌉⌈log_m 2d⌉.  With the paper's
-# h = 100 network (W ≈ 1.9·10^21, m = 10^6) that is q_0 = 71 · ⌈log_m 2d⌉,
-# so every layer that fits in memory takes the individual-kernel path; the
-# recursive path is exercised by the tests with small networks.
+# individual kernels when D ≤ q_0 = ⌈log_2 W⌉⌈log_m 2d⌉.  With the h = 46
+# complex network of Colkitt's improvement (W ≈ 1.3·10^17, m = 97336) that
+# is q_0 = 57 · ⌈log_m 2d⌉ (71 for the preprint's h = 100 network), so every
+# layer that fits in memory takes the individual-kernel path; the recursive
+# path is exercised by the tests with small networks.
 
 # Network constants visible to the layer: either an explicit LinearNetwork
 # (small, runnable) or the closed-form counts of the paper's network.
@@ -53,8 +54,9 @@ function LayerCtx(counts::MotifCounts, d::Int, p::Int; leaf::Int=ceil(Int, sqrt(
     LayerCtx(nothing, counts.W, big(counts.m), counts.s, ops, d, leaf, p,
              Dict{Tuple{Int,Int},Tuple{Vector{F2Vec},Vector{Int}}}())
 end
-# the paper's layer: the h = 100 complex network
-const PAPER_NETWORK = motif_counts(100, :complex)
+# the paper's layer: the h = 46 complex network (Colkitt's h46-nonadjacent-78
+# patch; the preprint's original choice was h = 100)
+const PAPER_NETWORK = motif_counts(46, :complex)
 paper_layer_ctx(d::Int, p::Int) = LayerCtx(PAPER_NETWORK, d, p)
 
 # number of selected bits processed individually before the rows are formed

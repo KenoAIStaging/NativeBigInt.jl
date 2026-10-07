@@ -7,7 +7,7 @@ const BN = NativeBigInt.BelowNLogN
 using .BN: FW, GC, tobig, mul_wide, mul_trunc, trunc_shr, round_shr, magbits, fits, resize, mul_i, mul_ipow,
     F2Space, f2zero_space, f2line, f2unit, f2full_space, f2span, f2dot, f2weight, f2project, f2perp_in,
     f2orthonormal_basis, f2nondegenerate,
-    motif_counts, motif_deficit, motif_network, complex_motif_network, run_scalar!, network_edges,
+    motif_counts, motif_deficit, motif_exponent, PAPER_NETWORK, motif_network, complex_motif_network, run_scalar!, network_edges,
     edge_residual, residual_rank_sum,
     LinearNetwork, Gate, Update, COEF_ONE, COEF_MINUS, LayerCtx, paper_layer_ctx, q0_bits, guard_bits,
     frame_change!, c_group!, c_kernels!, butterfly_layer!,
@@ -65,6 +65,23 @@ end
     @test motif_deficit(cb) == 339 // 22587335000000
     @test motif_deficit(cc) == 73 // 19906842167500
     @test cb.L // cb.N == 100 // 539 && cc.L // cc.N == 101 // 539
+    # Colkitt's constants at h = 46 (patch h46-nonadjacent-78)
+    cb = motif_counts(46, :bit); cc = motif_counts(46, :complex)
+    @test cb.v == 15180 && cb.N == 3497963832000 && cb.I == 691297200 && cb.m == 97336
+    @test cb.z == 2709 && cc.z == 12470
+    @test cb.W == 28434979789999200
+    @test cc.W == 130865855373752400
+    @test cb.s == big"2767747192266968049600"
+    @test cc.s == big"12737958894652805035200"
+    @test motif_deficit(cb) == 9 // 43518487588
+    @test motif_deficit(cc) == 7 // 22253827054
+    @test cb.L // cb.N == 23 // 55 && cc.L // cc.N == 47 // 110
+    # the rational certificate for τ = σ = 1 - a: both deficits exceed a·L, L > log m
+    a = 9 // 500000000000; L = 5743 // 500
+    @test log(cb.m) < L
+    @test motif_deficit(cb) > a * L && motif_deficit(cc) > a * L
+    @test motif_exponent(cc) < 1 - Float64(a)
+    @test PAPER_NETWORK.h == 46
     # the smallest instance whose complex deficit is positive
     @test motif_deficit(motif_counts(21, :complex)) <= 0
     @test motif_deficit(motif_counts(22, :complex)) > 0
@@ -223,8 +240,9 @@ end
         exact = h0_exact(Aq, sel)
         @test all(tobig(A[i]) == (truncq(real(exact[i]), p), truncq(imag(exact[i]), p)) for i in eachindex(A))
     end
-    @test q0_bits(paper_layer_ctx(8, p)) == 71
-    @test q0_bits(paper_layer_ctx(1000, p)) == 71
+    @test q0_bits(paper_layer_ctx(8, p)) == 57
+    @test q0_bits(paper_layer_ctx(1000, p)) == 57
+    @test q0_bits(LayerCtx(motif_counts(100, :complex), 8, p)) == 71
 end
 
 # --- synthetic transforms ----------------------------------------------------------------------
@@ -385,8 +403,9 @@ end
 end
 
 @testset "dispatch at the paper's cutoff" begin
-    using NativeBigInt: belownlogn_b, belownlogn_loglog, above_belownlogn_cutoff,
-                        MUL_BELOWNLOGN_THRESHOLD
+    using NativeBigInt: belownlogn_b, above_belownlogn_cutoff, MUL_BELOWNLOGN_THRESHOLD
+    using NativeBigInt.BelowNLogN: paper_dimension, pow_ge, Params
+    rng = MersenneTwister(0x46)
     # b = ⌈log2(64m)⌉ for the m-limb input string, any Integer m
     @test belownlogn_b(1) == 6
     @test belownlogn_b(2) == 7
@@ -395,29 +414,40 @@ end
     @test belownlogn_b(2^20 + 1) == 27
     @test belownlogn_b(big(2)^1000) == 1006
     @test belownlogn_b(big(2)^1000 + 1) == 1007
-    # exact ⌊log2 ⌊log6 b⌋⌋: steps up precisely at b = 6^(2^k)
-    for k in (0, 1, 2, 5, 10, 16)
-        b = big(6)^(big(2)^k)
-        @test belownlogn_loglog(b) == k
-        @test belownlogn_loglog(b - 1) == k - 1
-        @test belownlogn_loglog(b + 1) == k
-        @test belownlogn_loglog(2b) == k
+    # d = ⌊b^(1/40)⌋ by the paper's exact binary search
+    for b in (1, 6, 69, 2^40 - 1, 10^9)
+        @test paper_dimension(b) == 1
     end
-    @test belownlogn_loglog(6) == 0
-    @test belownlogn_loglog(69) == 1
-    @test MUL_BELOWNLOGN_THRESHOLD == 131    # K = ⌊d^c⌋ ≥ 6 ⟺ b ≥ 6^(2^131)
-    # the predicate fires exactly at b = 6^(2^k): with k = 3 that is
-    # b = ⌈log2(64m)⌉ ≥ 6^8, i.e. m ≥ 2^(6^8-7) + 1 limbs, a BigInt size
-    m3 = big(2)^(6^8 - 7) + 1
-    @test above_belownlogn_cutoff(m3; threshold=3)
-    @test !above_belownlogn_cutoff(m3 - 1; threshold=3)
-    @test above_belownlogn_cutoff(m3 + 1; threshold=3)
-    @test above_belownlogn_cutoff(2m3; threshold=3)
-    @test !above_belownlogn_cutoff(2m3; threshold=4)   # 6^16 bits of limb count won't fit in RAM
-    # no Int-sized operand reaches the real cutoff (b ≤ 69 gives ≤ 1)
+    @test paper_dimension(big(2)^40) == 2
+    @test paper_dimension(big(2)^40 - 1) == 1
+    @test paper_dimension(big(3)^40) == 3
+    @test paper_dimension(big(3)^40 - 1) == 2
+    @test paper_dimension(big(10)^40 + 5) == 10
+    for dd in 1:40
+        lo = big(dd)^40
+        b = lo + rand(rng, big(0):(big(dd + 1)^40 - lo - 1))
+        d = paper_dimension(b)
+        @test d == dd && d^40 <= b < (d + 1)^40
+    end
+    @test paper_dimension(big(2)^4000) == big(2)^100
+    @test Params(2^20).d == 1
+    @test Params(2^20; d=3).d == 3
+    # exact d^num ≥ k^den with the floor-log fast paths and the band
+    for d in 1:120, num in 1:4, k in 1:6, den in 1:14
+        @test pow_ge(d, num, k, den) == (big(d)^num >= big(k)^den)
+    end
+    @test pow_ge(big(6)^(10^6) , 9, 6, 9 * 10^6)          # band: exact powers decide
+    @test !pow_ge(big(6)^(10^6) - 1, 9, 6, 9 * 10^6)
+    @test MUL_BELOWNLOGN_THRESHOLD == 6     # K = ⌊d^c⌋ ≥ 6, c = 9/10^12
+    # the predicate fires on the K scale: K ≥ 1 always, K ≥ 2 needs d ≥ 2^(10^12/9)
+    for m in (1, 2, 64, big(2)^100000)
+        @test above_belownlogn_cutoff(m; threshold=1)
+        @test !above_belownlogn_cutoff(m; threshold=2)
+    end
+    # no Int-sized operand reaches the real cutoff (d = 1 below b = 2^40)
     for m in (1, 2, 3, 64, 2^20, 2^40, 2^57, typemax(Int) >> 1, typemax(Int))
         @test !above_belownlogn_cutoff(m)
-        @test belownlogn_loglog(belownlogn_b(m)) <= 1
+        @test paper_dimension(belownlogn_b(m)) == 1
     end
     @test !above_belownlogn_cutoff(big(2)^100000)
 end

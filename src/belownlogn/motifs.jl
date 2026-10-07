@@ -17,9 +17,12 @@
 # summing to s = Wm - 2N + 2L < Wm.  Those labels are what the array
 # engine in layers.jl turns into frame changes.
 #
-# The paper fixes h = 100.  That network has W ≈ 1.9·10^21 wires and its
-# frames act on 2^(10^6) addresses per role, so it exists here as closed-form
-# counts (motif_counts) rather than as a data structure; the generator
+# The preprint fixes h = 100 (W ≈ 1.9·10^21 wires); the improvement of
+# Colkitt (github.com/CrocSwap/integer-mult-bounds, patch h46-nonadjacent-78)
+# takes h = 46 (W ≈ 1.3·10^17, m = 97336), the winner of its exact search
+# over all h.  Even that network's frames act on 2^97336 addresses per role,
+# so it exists here as closed-form counts (motif_counts) rather than as a
+# data structure; the generator
 # (complex_motif_network / bit_motif_network) builds the same construction
 # for small h, where the scalar exchange lemma and the residual table can
 # be checked directly.  The smallest h at which the complex network's rank
@@ -66,8 +69,10 @@ end
 # relative rank deficit η = (Wm - s)/(Wm); the saving exists iff η > 0
 motif_deficit(c::MotifCounts) = (c.W * c.m - c.s) // (c.W * c.m)
 
-# The exponent σ with s/W < m^σ, as a Float64 (log_m(s/W)); the paper's
-# rational bound is σ = 1 - 2^-50 for h = 100.
+# The exponent σ with s/W < m^σ, as a Float64 (log_m(s/W)); the rational
+# bounds are σ = 1 - 2^-50 for h = 100 (preprint) and σ = 1 - 9/(5·10^11)
+# for h = 46 (Colkitt), certified by both deficits exceeding a·L with
+# L = 5743/500 > log m.
 motif_exponent(c::MotifCounts) = log(Float64(c.s // c.W)) / log(Float64(c.m))
 
 # --- the explicit networks ----------------------------------------------------
